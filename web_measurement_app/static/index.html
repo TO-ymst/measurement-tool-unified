@@ -17,61 +17,8 @@
 
     <main>
       <section class="panel">
-        <h2>測定パラメータ</h2>
+        <h2>測定設定</h2>
         <form id="config-form">
-          <div class="form-grid">
-            <label>測定方式
-              <select name="measurement_mode" id="measurement-mode-select">
-                <option value="local">ローカル</option>
-                <option value="remote_ssh">Jetson(SSH)</option>
-              </select>
-            </label>
-            <label>SSID
-              <input type="text" name="ssid" list="ssid-options" placeholder="対象SSID" required />
-              <datalist id="ssid-options"></datalist>
-            </label>
-            <label>バンド
-              <select name="band" id="band-select">
-                <option value="2.4GHz">2.4GHz</option>
-                <option value="5GHz">5GHz</option>
-                <option value="6GHz">6GHz</option>
-              </select>
-            </label>
-            <label>Channel Min
-              <input type="number" name="channel_min" min="1" />
-            </label>
-            <label>Channel Max
-              <input type="number" name="channel_max" min="1" />
-            </label>
-            <label>ログ Prefix
-              <input type="text" name="prefix" placeholder="例: buildingA_" />
-            </label>
-            <label>ログ Base 名
-              <input type="text" name="log_base" />
-            </label>
-            <label>出力ディレクトリ
-              <input type="text" name="output_dir" value="." />
-            </label>
-            <label>スキャン間隔 (秒)
-              <input type="number" step="0.1" min="0.1" name="interval" />
-            </label>
-            <label>Wi-Fi未接続時代替値
-              <input type="number" name="wifi_disconnected_value" />
-            </label>
-            <label>Ping失敗時代替値
-              <input type="number" name="ping_fail_value" />
-            </label>
-            <label>Pingタイムアウト (ms)
-              <input type="number" name="ping_timeout_ms" min="1" max="60000" step="1" />
-            </label>
-            <label>タイムゾーン
-              <input type="text" name="timezone" id="timezone-select" />
-            </label>
-            <label>保持行数
-              <input type="number" name="retain_rows" min="1000" max="200000" value="20000" />
-            </label>
-          </div>
-
           <section class="config-section local-config-section" id="local-config-section">
             <div class="config-section-header">
               <h3>ローカル測定設定</h3>
@@ -172,6 +119,64 @@
                 </label>
               </div>
             </details>
+          </section>
+          <section class="config-section">
+            <div class="config-section-header">
+              <h3>測定パラメータ</h3>
+              <p>接続条件、ログ出力、測定間隔を設定します。</p>
+            </div>
+            <div class="form-grid">
+              <label>測定方式
+                <select name="measurement_mode" id="measurement-mode-select">
+                  <option value="local">ローカル</option>
+                  <option value="remote_ssh">Jetson(SSH)</option>
+                </select>
+              </label>
+              <label>SSID
+                <input type="text" name="ssid" list="ssid-options" placeholder="対象SSID" required />
+                <datalist id="ssid-options"></datalist>
+              </label>
+              <label>バンド
+                <select name="band" id="band-select">
+                  <option value="2.4GHz">2.4GHz</option>
+                  <option value="5GHz">5GHz</option>
+                  <option value="6GHz">6GHz</option>
+                </select>
+              </label>
+              <label>Channel Min
+                <input type="number" name="channel_min" min="1" />
+              </label>
+              <label>Channel Max
+                <input type="number" name="channel_max" min="1" />
+              </label>
+              <label>ログ Prefix
+                <input type="text" name="prefix" placeholder="例: buildingA_" />
+              </label>
+              <label>ログ Base 名
+                <input type="text" name="log_base" />
+              </label>
+              <label>出力ディレクトリ
+                <input type="text" name="output_dir" value="." />
+              </label>
+              <label>スキャン間隔 (秒)
+                <input type="number" step="0.1" min="0.1" name="interval" />
+              </label>
+              <label>Wi-Fi未接続時代替値
+                <input type="number" name="wifi_disconnected_value" />
+              </label>
+              <label>Ping失敗時代替値
+                <input type="number" name="ping_fail_value" />
+              </label>
+              <label>Pingタイムアウト (ms)
+                <input type="number" name="ping_timeout_ms" min="1" max="60000" step="1" />
+              </label>
+              <label>タイムゾーン
+                <input type="text" name="timezone" id="timezone-select" />
+              </label>
+              <label>保持行数
+                <input type="number" name="retain_rows" min="1000" max="200000" value="20000" />
+              </label>
+            </div>
           </section>
           <section class="config-section">
             <div class="config-section-header">
