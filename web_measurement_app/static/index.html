@@ -83,6 +83,24 @@
               <label><input type="checkbox" name="use_sudo" checked /> nmcliにsudoを使用</label>
               <label><input type="checkbox" name="sync_time" checked /> 測定中のみ時刻同期 (timedatectl)</label>
             </div>
+            <section class="config-section" id="bssid-switch-section">
+              <div class="config-section-header">
+                <h3>Jetson BSSID切替テスト</h3>
+                <p>測定を一時停止して指定APへ接続し、接続結果とPing先を更新します。</p>
+              </div>
+              <p class="hint">USBまたは有線LANでJetsonへ接続中にのみ実行してください。Wi-Fi接続中に切り替えるとダッシュボードとの通信が切断されます。</p>
+              <div class="form-grid">
+                <label>接続候補AP
+                  <select id="bssid-switch-select" disabled></select>
+                </label>
+              </div>
+              <div class="actions">
+                <button type="button" id="refresh-bssid-btn">候補APを更新</button>
+                <label><input type="checkbox" id="bssid-switch-confirm" /> USBまたは有線LANで接続中であることを確認した</label>
+                <button type="button" id="switch-bssid-btn" disabled>選択したBSSIDへ切替</button>
+              </div>
+              <small class="hint" id="bssid-switch-status">ローカル測定を開始してから実行してください。</small>
+            </section>
           </section>
 
           <section class="config-section remote-config-section" id="remote-config-section">

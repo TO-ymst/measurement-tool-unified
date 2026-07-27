@@ -32,7 +32,7 @@
 | --- | --- |
 | `*.csv` | ポイント、接続AP、Ping、最良ネイバーを含む測定ログ |
 | `*_neighbors.csv` | スキャン時に見つかった全ネイバーAPの詳細 |
-| `*_events.csv` | BSSID切替などの接続イベント用。BSSID切替画面の追加後に使用 |
+| `*_events.csv` | JetsonローカルのBSSID切替イベント、接続結果、接続後BSSIDを記録 |
 | `*_remote_advanced_*.jsonl` | SSHリモート測定中の障害解析ログ。有効化時のみ出力 |
 | `*.png` | ダッシュボードで書き出したプロット画像 |
 
@@ -52,8 +52,11 @@ SSHリモート測定では、必要に応じて次のタイミングで追加�
 - Jetson: `install_jetson.sh` を一度実行し、`start_jetson.sh` で起動
 - Jetson自動起動: `install_service_jetson.sh`
 
-## 実装予定
+## Jetson BSSID切替テスト
 
-- Jetsonローカルでの指定BSSIDへの接続切替
-- 切替前後のSSID/BSSID、所要時間、結果の `*_events.csv` への記録
-- この操作はUSBまたは有線LANでダッシュボードへ接続中であることを確認した場合だけ実行可能にする
+- Jetsonローカル測定中に、周辺AP一覧からSSID/BSSIDを指定して接続先を切替
+- 切替中は測定ループと `nmcli` 操作を排他し、ログの競合を防止
+- 切替後に接続BSSIDを検証し、Gatewayを再検出
+- 切替前後のSSID/BSSID・所要時間・結果を `*_events.csv` に記録
+- ダッシュボードの確認チェックと確認ダイアログを通過した場合だけ実行
+- USBまたは有線LAN経由でダッシュボードへ接続中にのみ使用すること。Wi-Fi経由で実行するとブラウザとの通信が切断されます。

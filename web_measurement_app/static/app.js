@@ -36,6 +36,12 @@ const exportTitleInput = document.getElementById("export-title");
 const exportButton = document.getElementById("export-btn");
 const exportAllButton = document.getElementById("export-all-btn");
 const remotePrepareBtn = document.getElementById("remote-prepare-btn");
+const bssidSwitchSection = document.getElementById("bssid-switch-section");
+const bssidSwitchSelect = document.getElementById("bssid-switch-select");
+const refreshBssidBtn = document.getElementById("refresh-bssid-btn");
+const bssidSwitchConfirm = document.getElementById("bssid-switch-confirm");
+const switchBssidBtn = document.getElementById("switch-bssid-btn");
+const bssidSwitchStatus = document.getElementById("bssid-switch-status");
 const titleToggle = document.getElementById("title-toggle");
 const timezoneSelect = document.getElementById("timezone-select");
 const ssidDatalist = document.getElementById("ssid-options");
@@ -169,6 +175,18 @@ function attachEvents() {
   if (remotePrepareBtn) {
     remotePrepareBtn.addEventListener("click", handleRemotePrepare);
   }
+  if (refreshBssidBtn) {
+    refreshBssidBtn.addEventListener("click", loadBssidCandidates);
+  }
+  if (bssidSwitchConfirm) {
+    bssidSwitchConfirm.addEventListener("change", syncBssidSwitchState);
+  }
+  if (bssidSwitchSelect) {
+    bssidSwitchSelect.addEventListener("change", syncBssidSwitchState);
+  }
+  if (switchBssidBtn) {
+    switchBssidBtn.addEventListener("click", handleBssidSwitch);
+  }
   if (undoPointBtn) {
     undoPointBtn.addEventListener("click", handleUndoLastPoint);
   }
@@ -252,6 +270,8 @@ function syncMeasurementModeState() {
   localSection?.classList.toggle("is-inactive", isRemote);
   remoteSection?.classList.toggle("is-active", isRemote);
   remoteSection?.classList.toggle("is-inactive", !isRemote);
+  bssidSwitchSection?.classList.toggle("is-active", !isRemote);
+  bssidSwitchSection?.classList.toggle("is-inactive", isRemote);
 
   document.querySelectorAll(".remote-config-grid input").forEach((input) => {
     input.disabled = !isRemote;
@@ -290,6 +310,75 @@ function syncMeasurementModeState() {
     pingTargetHint.textContent = isRemote
       ? "remote_ssh では Jetson 側から ping します。未指定なら Jetson 側のデフォルトGatewayを使います。"
       : "Gateway自動検出ON時は入力不可です。";
+  }
+  syncBssidSwitchState();
+}
+
+function syncBssidSwitchState() {
+  const isLocal = measurementModeSelect?.value !== "remote_ssh";
+  const hasCandidate = Boolean(bssidSwitchSelect?.value);
+  const confirmed = Boolean(bssidSwitchConfirm?.checked);
+  if (refreshBssidBtn) refreshBssidBtn.disabled = !isLocal;
+  if (bssidSwitchSelect) bssidSwitchSelect.disabled = !isLocal;
+  if (switchBssidBtn) switchBssidBtn.disabled = !isLocal || !state.running || !hasCandidate || !confirmed;
+  if (bssidSwitchStatus && !isLocal) {
+    bssidSwitchStatus.textContent = "Jetsonローカル測定でのみ使用できます。";
+  }
+}
+
+async function loadBssidCandidates() {
+  if (measurementModeSelect?.value === "remote_ssh") return;
+  try {
+    if (refreshBssidBtn) refreshBssidBtn.disabled = true;
+    if (bssidSwitchStatus) bssidSwitchStatus.textContent = "候補APを取得中...";
+    const response = await fetch("/api/local/access-points");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "候補APの取得に失敗しました");
+    if (bssidSwitchSelect) {
+      bssidSwitchSelect.replaceChildren();
+      const placeholder = new Option("接続先BSSIDを選択", "");
+      bssidSwitchSelect.add(placeholder);
+      for (const ap of data.access_points || []) {
+        const label = `${ap.ssid || "(hidden)"} | ${ap.bssid} | CH ${ap.channel || "-"} | ${ap.signal || "-"}%`;
+        const option = new Option(label, ap.bssid || "");
+        option.dataset.ssid = ap.ssid || "";
+        bssidSwitchSelect.add(option);
+      }
+    }
+    const current = data.current || {};
+    if (bssidSwitchStatus) {
+      bssidSwitchStatus.textContent = `現在: ${current.ssid || "-"} / ${current.bssid || "-"}`;
+    }
+  } catch (error) {
+    if (bssidSwitchStatus) bssidSwitchStatus.textContent = error.message;
+  } finally {
+    syncBssidSwitchState();
+  }
+}
+
+async function handleBssidSwitch() {
+  const selected = bssidSwitchSelect?.selectedOptions?.[0];
+  const ssid = selected?.dataset?.ssid || "";
+  const bssid = selected?.value || "";
+  if (!ssid || !bssid || !bssidSwitchConfirm?.checked) return;
+  if (!window.confirm(`JetsonのWi-Fiを ${ssid} / ${bssid} へ切り替えます。USBまたは有線LANで接続中であることを確認してください。`)) return;
+  try {
+    if (switchBssidBtn) switchBssidBtn.disabled = true;
+    if (bssidSwitchStatus) bssidSwitchStatus.textContent = "BSSIDを切り替え中...";
+    const response = await fetch("/api/local/switch-bssid", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ssid, bssid, acknowledged_usb_or_lan: true }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "BSSID切替に失敗しました");
+    if (form.ssid && data.connected?.ssid) form.ssid.value = data.connected.ssid;
+    if (bssidSwitchStatus) bssidSwitchStatus.textContent = `切替完了: ${data.connected?.ssid || ssid} / ${data.connected?.bssid || bssid}`;
+    await loadBssidCandidates();
+  } catch (error) {
+    if (bssidSwitchStatus) bssidSwitchStatus.textContent = error.message;
+  } finally {
+    syncBssidSwitchState();
   }
 }
 
@@ -533,6 +622,7 @@ function updateStatus(status) {
     advancedLogPathEl.textContent = status.advanced_log_file || "-";
   }
   state.currentLogFile = status.log_file || "";
+  syncBssidSwitchState();
   if (status.ping_target) {
     pingDetailsEl.textContent = `${status.ping_target} (${status.ping_target_source})`;
   } else if (status.ping_target_source === "remote_gateway_auto") {

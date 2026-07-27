@@ -78,6 +78,7 @@ CONNECTION_EVENT_HEADERS = [
     "ConnectedSSID",
     "ConnectedBSSID",
     "Channel",
+    "DurationMs",
     "Result",
     "Details",
 ]

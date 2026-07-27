@@ -60,6 +60,12 @@ class RemoteSetupRequest(BaseModel):
     remote_ssh_key_comment: str | None = None
 
 
+class BssidSwitchRequest(BaseModel):
+    ssid: str
+    bssid: str
+    acknowledged_usb_or_lan: bool = False
+
+
 def _resolve_source_csv_path(source_csv: str | None) -> Path:
     if source_csv:
         path = Path(source_csv).expanduser()
@@ -216,6 +222,24 @@ async def cleanup_remote_measurement(payload: RemoteSetupRequest):
 async def stop_measurement():
     status = service.stop()
     return status
+
+
+@app.get("/api/local/access-points")
+async def list_local_access_points():
+    try:
+        return service.list_local_access_points()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/local/switch-bssid")
+async def switch_local_bssid(payload: BssidSwitchRequest):
+    if not payload.acknowledged_usb_or_lan:
+        raise HTTPException(status_code=400, detail="Confirm that the dashboard is connected through USB or wired LAN")
+    try:
+        return service.switch_local_bssid(payload.ssid, payload.bssid)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/advance-point")

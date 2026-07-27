@@ -19,6 +19,7 @@ from .logger_core import (
     ADVANCED_EVENT_PING_TIMEOUT,
     ADVANCED_EVENT_SSH_FAILED,
     CHANNEL_FILTER,
+    CONNECTION_EVENT_HEADERS,
     DEFAULT_BAND,
     DEFAULT_INTERVAL,
     DEFAULT_LOG_BASE,
@@ -41,7 +42,10 @@ from .logger_core import (
     ensure_remote_ssh_key,
     fetch_remote_wifi_state,
     fetch_wifi_rows,
+    get_current_local_wifi_state,
     get_ping_result,
+    IS_WINDOWS,
+    prepare_connection_event_file,
     prepare_neighbor_log_file,
     prepare_log_file,
     prepare_sidecar_file,
@@ -50,6 +54,7 @@ from .logger_core import (
     resolve_ping_target,
     scan_local_neighbors,
     should_run_neighbor_scan,
+    switch_local_wifi_bssid,
 )
 
 
@@ -162,6 +167,7 @@ class MeasurementStatus(BaseModel):
     log_index: int
     log_file: Optional[str]
     neighbor_log_file: Optional[str]
+    connection_event_file: Optional[str]
     advanced_log_file: Optional[str]
     ping_target: Optional[str]
     ping_target_source: Optional[str]
@@ -215,6 +221,7 @@ class MeasurementService:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
+        self._network_switch_lock = threading.Lock()
         self._current_point = 1
         self._log_index = 0
         self._listeners: set[asyncio.Queue] = set()
@@ -222,6 +229,7 @@ class MeasurementService:
         self._config: Optional[MeasurementConfig] = None
         self._log_path: Optional[Path] = None
         self._neighbor_log_path: Optional[Path] = None
+        self._connection_event_path: Optional[Path] = None
         self._neighbor_log_index = 0
         self._neighbor_scan_index = 0
         self._advanced_log_path: Optional[Path] = None
@@ -251,6 +259,7 @@ class MeasurementService:
             prefix = config.prefix or ""
             self._log_path = prepare_log_file(prefix, config.log_base, config.output_dir)
             self._neighbor_log_path = prepare_neighbor_log_file(self._log_path)
+            self._connection_event_path = prepare_connection_event_file(self._log_path)
             self._neighbor_log_index = 0
             self._neighbor_scan_index = 0
             self._advanced_log_path = (
@@ -261,6 +270,8 @@ class MeasurementService:
             self._last_seen_remote_bssid = None
             self._remote_ping_timeout_streak = 0
             self._remote_timeout_snapshot_taken = False
+            with self._connection_event_path.open("w", newline="", encoding="utf-8-sig") as event_file:
+                csv.writer(event_file).writerow(CONNECTION_EVENT_HEADERS)
 
             if config.measurement_mode == "remote_ssh":
                 self._ping_target_info = (
@@ -319,6 +330,7 @@ class MeasurementService:
             log_index=self._log_index,
             log_file=str(self._log_path) if self._log_path else None,
             neighbor_log_file=str(self._neighbor_log_path) if self._neighbor_log_path else None,
+            connection_event_file=str(self._connection_event_path) if self._connection_event_path else None,
             advanced_log_file=str(self._advanced_log_path) if self._advanced_log_path else None,
             ping_target=self._ping_target_info[0] if self._ping_target_info else None,
             ping_target_source=self._ping_target_info[1] if self._ping_target_info else None,
@@ -349,6 +361,91 @@ class MeasurementService:
         with self._lock:
             deque_list = self._history.get(point, deque())
             return list(deque_list)
+
+    def list_local_access_points(self) -> Dict[str, Any]:
+        if IS_WINDOWS:
+            raise RuntimeError("BSSID switching is available on Jetson/Linux only")
+        with self._lock:
+            config = self._config
+        use_sudo = config.use_sudo if config and config.measurement_mode == "local" else DEFAULT_USE_SUDO
+        with self._network_switch_lock:
+            current = get_current_local_wifi_state(use_sudo)
+            access_points = scan_local_neighbors(use_sudo, None)
+        return {"current": current, "access_points": access_points}
+
+    def switch_local_bssid(self, ssid: str, bssid: str) -> Dict[str, Any]:
+        if IS_WINDOWS:
+            raise RuntimeError("BSSID switching is available on Jetson/Linux only")
+        with self._lock:
+            config = self._config
+            running = self._thread is not None and self._thread.is_alive()
+        if not config or config.measurement_mode != "local" or not running:
+            raise RuntimeError("Start local measurement before switching BSSID")
+
+        with self._network_switch_lock:
+            before = get_current_local_wifi_state(config.use_sudo)
+            started_at = dt.datetime.now().isoformat(timespec="seconds")
+            started_monotonic = time.monotonic()
+            try:
+                connected = switch_local_wifi_bssid(config.use_sudo, ssid, bssid)
+                if config.auto_gateway:
+                    self._ping_target_info = resolve_ping_target(
+                        config.ping_target, config.auto_gateway, DEFAULT_PING_TARGET
+                    )
+                self._write_connection_event(
+                    started_at,
+                    ssid,
+                    bssid,
+                    connected,
+                    round((time.monotonic() - started_monotonic) * 1000),
+                    "success",
+                    f"from={before.get('bssid', '')}",
+                )
+                return {
+                    "ok": True,
+                    "before": before,
+                    "connected": connected,
+                    "ping_target": self._ping_target_info[0] if self._ping_target_info else "",
+                }
+            except Exception as exc:  # noqa: BLE001
+                self._write_connection_event(
+                    started_at,
+                    ssid,
+                    bssid,
+                    {},
+                    round((time.monotonic() - started_monotonic) * 1000),
+                    "failed",
+                    str(exc),
+                )
+                raise
+
+    def _write_connection_event(
+        self,
+        timestamp: str,
+        ssid: str,
+        bssid: str,
+        connected: Dict[str, Any],
+        duration_ms: int,
+        result: str,
+        details: str,
+    ) -> None:
+        if not self._connection_event_path:
+            return
+        with self._connection_event_path.open("a", newline="", encoding="utf-8") as event_file:
+            csv.writer(event_file).writerow(
+                [
+                    timestamp,
+                    "bssid_switch",
+                    ssid,
+                    bssid,
+                    connected.get("ssid", ""),
+                    connected.get("bssid", ""),
+                    connected.get("channel", ""),
+                    duration_ms,
+                    result,
+                    details,
+                ]
+            )
 
     def register_listener(self) -> asyncio.Queue:
         if not self._loop:
@@ -395,9 +492,10 @@ class MeasurementService:
                                     config=config,
                                 )
                         else:
-                            self._run_local_iteration(
-                                writer, csv_file, neighbor_writer, config, target_ip, sample_no
-                            )
+                            with self._network_switch_lock:
+                                self._run_local_iteration(
+                                    writer, csv_file, neighbor_writer, config, target_ip, sample_no
+                                )
                         time.sleep(config.interval)
                 finally:
                     if advanced_file is not None:
