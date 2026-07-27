@@ -41,7 +41,6 @@ const apSwitchSelect = document.getElementById("ap-switch-select");
 const apSwitchPassword = document.getElementById("ap-switch-password");
 const bssidSwitchSelect = document.getElementById("bssid-switch-select");
 const refreshBssidBtn = document.getElementById("refresh-bssid-btn");
-const bssidSwitchConfirm = document.getElementById("bssid-switch-confirm");
 const switchApBtn = document.getElementById("switch-ap-btn");
 const fixApBtn = document.getElementById("fix-ap-btn");
 const clearApFixBtn = document.getElementById("clear-ap-fix-btn");
@@ -191,9 +190,6 @@ function attachEvents() {
   }
   if (refreshBssidBtn) {
     refreshBssidBtn.addEventListener("click", loadAccessPointCandidates);
-  }
-  if (bssidSwitchConfirm) {
-    bssidSwitchConfirm.addEventListener("change", syncBssidSwitchState);
   }
   if (bssidSwitchSelect) {
     bssidSwitchSelect.addEventListener("change", syncBssidSwitchState);
@@ -354,19 +350,18 @@ function syncBssidSwitchState() {
   const bssidTestEnabled = isAvailable && state.bssidSwitchEnabledSsid === currentSsid;
   const hasCandidate = Boolean(bssidSwitchSelect?.value);
   const hasApCandidate = Boolean(apSwitchSelect?.value);
-  const confirmed = Boolean(bssidSwitchConfirm?.checked);
   bssidSwitchSection?.classList.toggle("is-active", isAvailable);
   bssidSwitchSection?.classList.toggle("is-inactive", !isAvailable);
   if (refreshBssidBtn) refreshBssidBtn.disabled = !isAvailable;
   if (apSwitchSelect) apSwitchSelect.disabled = !isAvailable;
   if (apSwitchPassword) apSwitchPassword.disabled = !isAvailable;
-  if (switchApBtn) switchApBtn.disabled = !isAvailable || !hasApCandidate || !confirmed;
-  if (fixApBtn) fixApBtn.disabled = !bssidTestEnabled || !confirmed;
-  if (clearApFixBtn) clearApFixBtn.disabled = !isAvailable || state.apLock?.locked !== "yes" || !confirmed;
+  if (switchApBtn) switchApBtn.disabled = !isAvailable || !hasApCandidate;
+  if (fixApBtn) fixApBtn.disabled = !bssidTestEnabled;
+  if (clearApFixBtn) clearApFixBtn.disabled = !isAvailable || state.apLock?.locked !== "yes";
   if (bssidSwitchSelect) bssidSwitchSelect.disabled = !bssidTestEnabled;
-  if (switchBssidBtn) switchBssidBtn.disabled = !bssidTestEnabled || !state.running || !hasCandidate || !confirmed;
-  if (fixBssidBtn) fixBssidBtn.disabled = !bssidTestEnabled || !state.running || !confirmed;
-  if (clearBssidFixBtn) clearBssidFixBtn.disabled = !isAvailable || !state.bssidLock?.bssid || !confirmed;
+  if (switchBssidBtn) switchBssidBtn.disabled = !bssidTestEnabled || !state.running || !hasCandidate;
+  if (fixBssidBtn) fixBssidBtn.disabled = !bssidTestEnabled || !state.running;
+  if (clearBssidFixBtn) clearBssidFixBtn.disabled = !isAvailable || !state.bssidLock?.bssid;
   if (bssidSwitchStatus && !isLocal) {
     bssidSwitchStatus.textContent = "Jetsonローカル測定でのみ使用できます。";
   }
@@ -442,7 +437,7 @@ function bssidTestEnabledMessage(currentSsid) {
 async function handleApSwitch() {
   const ssid = apSwitchSelect?.value || "";
   const password = apSwitchPassword?.value || "";
-  if (!ssid || !bssidSwitchConfirm?.checked) return;
+  if (!ssid) return;
   if (!window.confirm(`Jetsonの接続先を ${ssid} へ切り替えます。USBまたは有線LANで接続中であることを確認してください。`)) return;
   try {
     if (switchApBtn) switchApBtn.disabled = true;
@@ -466,8 +461,7 @@ async function handleApSwitch() {
 }
 
 async function handleApFix() {
-  if (!bssidSwitchConfirm?.checked) return;
-  if (!window.confirm("現在接続中のAP（SSID）を自動接続の最優先に固定します。")) return;
+  if (!window.confirm("現在接続中のAP（SSID）を自動接続の最優先に固定します。USBまたは有線LANで接続中であることを確認してください。")) return;
   try {
     if (fixApBtn) fixApBtn.disabled = true;
     if (apSwitchStatus) apSwitchStatus.textContent = "APを固定中...";
@@ -488,8 +482,7 @@ async function handleApFix() {
 }
 
 async function handleClearApFix() {
-  if (!bssidSwitchConfirm?.checked) return;
-  if (!window.confirm("APの自動接続優先を通常値へ戻します。")) return;
+  if (!window.confirm("APの自動接続優先を通常値へ戻します。USBまたは有線LANで接続中であることを確認してください。")) return;
   try {
     if (clearApFixBtn) clearApFixBtn.disabled = true;
     if (apSwitchStatus) apSwitchStatus.textContent = "AP固定を解除中...";
@@ -513,7 +506,7 @@ async function handleBssidSwitch() {
   const selected = bssidSwitchSelect?.selectedOptions?.[0];
   const ssid = selected?.dataset?.ssid || "";
   const bssid = selected?.value || "";
-  if (!ssid || !bssid || !bssidSwitchConfirm?.checked) return;
+  if (!ssid || !bssid) return;
   if (!window.confirm(`JetsonのWi-Fiを ${ssid} / ${bssid} へ切り替えます。USBまたは有線LANで接続中であることを確認してください。`)) return;
   try {
     if (switchBssidBtn) switchBssidBtn.disabled = true;
@@ -536,8 +529,7 @@ async function handleBssidSwitch() {
 }
 
 async function handleBssidFix() {
-  if (!bssidSwitchConfirm?.checked) return;
-  if (!window.confirm("現在接続中のBSSIDを接続プロファイルへ固定します。")) return;
+  if (!window.confirm("現在接続中のBSSIDを接続プロファイルへ固定します。USBまたは有線LANで接続中であることを確認してください。")) return;
   try {
     if (fixBssidBtn) fixBssidBtn.disabled = true;
     if (bssidSwitchStatus) bssidSwitchStatus.textContent = "BSSIDを固定中...";
@@ -558,8 +550,7 @@ async function handleBssidFix() {
 }
 
 async function handleClearBssidFix() {
-  if (!bssidSwitchConfirm?.checked) return;
-  if (!window.confirm("接続プロファイルのBSSID固定を解除します。")) return;
+  if (!window.confirm("接続プロファイルのBSSID固定を解除します。USBまたは有線LANで接続中であることを確認してください。")) return;
   try {
     if (clearBssidFixBtn) clearBssidFixBtn.disabled = true;
     if (bssidSwitchStatus) bssidSwitchStatus.textContent = "BSSID固定を解除中...";
