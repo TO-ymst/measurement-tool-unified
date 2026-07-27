@@ -69,6 +69,7 @@ class BssidSwitchRequest(BaseModel):
 
 class ApSwitchRequest(BaseModel):
     ssid: str
+    password: str | None = None
     acknowledged_usb_or_lan: bool = False
 
 
@@ -258,7 +259,7 @@ async def switch_local_ap(payload: ApSwitchRequest):
     if not payload.acknowledged_usb_or_lan:
         raise HTTPException(status_code=400, detail="Confirm that the dashboard is connected through USB or wired LAN")
     try:
-        return service.switch_local_ap(payload.ssid)
+        return service.switch_local_ap(payload.ssid, payload.password)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

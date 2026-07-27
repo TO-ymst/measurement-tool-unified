@@ -388,7 +388,7 @@ class MeasurementService:
             "bssid_lock": bssid_lock,
         }
 
-    def switch_local_ap(self, ssid: str) -> Dict[str, Any]:
+    def switch_local_ap(self, ssid: str, password: Optional[str] = None) -> Dict[str, Any]:
         if IS_WINDOWS:
             raise RuntimeError("AP switching is available on Jetson/Linux only")
         normalized_ssid = ssid.strip()
@@ -405,7 +405,7 @@ class MeasurementService:
             started_at = dt.datetime.now().isoformat(timespec="seconds")
             started_monotonic = time.monotonic()
             try:
-                connected = switch_local_wifi_ssid(use_sudo, normalized_ssid)
+                connected = switch_local_wifi_ssid(use_sudo, normalized_ssid, password)
                 self._refresh_local_ping_target(config)
                 with self._lock:
                     self._bssid_switch_enabled_ssid = normalized_ssid

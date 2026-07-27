@@ -38,6 +38,7 @@ const exportAllButton = document.getElementById("export-all-btn");
 const remotePrepareBtn = document.getElementById("remote-prepare-btn");
 const bssidSwitchSection = document.getElementById("bssid-switch-section");
 const apSwitchSelect = document.getElementById("ap-switch-select");
+const apSwitchPassword = document.getElementById("ap-switch-password");
 const bssidSwitchSelect = document.getElementById("bssid-switch-select");
 const refreshBssidBtn = document.getElementById("refresh-bssid-btn");
 const bssidSwitchConfirm = document.getElementById("bssid-switch-confirm");
@@ -349,6 +350,7 @@ function syncBssidSwitchState() {
   bssidSwitchSection?.classList.toggle("is-inactive", !isAvailable);
   if (refreshBssidBtn) refreshBssidBtn.disabled = !isAvailable;
   if (apSwitchSelect) apSwitchSelect.disabled = !isAvailable;
+  if (apSwitchPassword) apSwitchPassword.disabled = !isAvailable;
   if (switchApBtn) switchApBtn.disabled = !isAvailable || !hasApCandidate || !confirmed;
   if (bssidSwitchSelect) bssidSwitchSelect.disabled = !bssidTestEnabled;
   if (switchBssidBtn) switchBssidBtn.disabled = !bssidTestEnabled || !state.running || !hasCandidate || !confirmed;
@@ -425,6 +427,7 @@ function bssidTestEnabledMessage(currentSsid) {
 
 async function handleApSwitch() {
   const ssid = apSwitchSelect?.value || "";
+  const password = apSwitchPassword?.value || "";
   if (!ssid || !bssidSwitchConfirm?.checked) return;
   if (!window.confirm(`Jetsonの接続先を ${ssid} へ切り替えます。USBまたは有線LANで接続中であることを確認してください。`)) return;
   try {
@@ -433,11 +436,12 @@ async function handleApSwitch() {
     const response = await fetch("/api/local/switch-ap", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ssid, acknowledged_usb_or_lan: true }),
+      body: JSON.stringify({ ssid, password: password || null, acknowledged_usb_or_lan: true }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || "AP切替に失敗しました");
     if (form.ssid && data.connected?.ssid) form.ssid.value = data.connected.ssid;
+    if (apSwitchPassword) apSwitchPassword.value = "";
     if (apSwitchStatus) apSwitchStatus.textContent = `AP切替完了: ${data.connected?.ssid || ssid}`;
     await loadAccessPointCandidates();
   } catch (error) {

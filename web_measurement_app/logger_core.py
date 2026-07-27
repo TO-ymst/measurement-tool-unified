@@ -740,14 +740,17 @@ def _run_local_nmcli(use_sudo: bool, args: List[str], timeout: int = 35) -> str:
     return result.stdout
 
 
-def switch_local_wifi_ssid(use_sudo: bool, ssid: str) -> Dict[str, object]:
+def switch_local_wifi_ssid(use_sudo: bool, ssid: str, password: Optional[str] = None) -> Dict[str, object]:
     if IS_WINDOWS:
         raise RuntimeError("AP switching is supported on Jetson/Linux only")
     normalized_ssid = ssid.strip()
     if not normalized_ssid:
         raise RuntimeError("SSID is required")
 
-    _run_local_nmcli(use_sudo, ["--wait", "30", "device", "wifi", "connect", normalized_ssid])
+    args = ["--wait", "30", "device", "wifi", "connect", normalized_ssid]
+    if password:
+        args.extend(["password", password])
+    _run_local_nmcli(use_sudo, args)
     connected = get_current_local_wifi_state(use_sudo)
     if str(connected.get("ssid", "")).strip() != normalized_ssid:
         raise RuntimeError("Connected SSID verification failed")
