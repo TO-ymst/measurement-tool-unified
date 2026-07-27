@@ -43,6 +43,7 @@ from .logger_core import (
     fetch_remote_wifi_state,
     fetch_wifi_rows,
     get_current_local_wifi_state,
+    get_local_wifi_ap_lock,
     get_local_wifi_bssid_lock,
     get_ping_result,
     IS_WINDOWS,
@@ -54,6 +55,7 @@ from .logger_core import (
     remove_remote_ssh_key,
     resolve_ping_target,
     scan_local_neighbors,
+    set_local_wifi_ap_lock,
     set_local_wifi_bssid_lock,
     should_run_neighbor_scan,
     switch_local_wifi_ssid,
@@ -381,11 +383,16 @@ class MeasurementService:
                 bssid_lock = get_local_wifi_bssid_lock(use_sudo)
             except RuntimeError:
                 bssid_lock = {"connection": "", "bssid": ""}
+            try:
+                ap_lock = get_local_wifi_ap_lock(use_sudo)
+            except RuntimeError:
+                ap_lock = {"connection": "", "ssid": "", "priority": "0", "locked": "no"}
         return {
             "current": current,
             "access_points": access_points,
             "bssid_switch_enabled_ssid": enabled_ssid,
             "bssid_lock": bssid_lock,
+            "ap_lock": ap_lock,
         }
 
     def switch_local_ap(self, ssid: str, password: Optional[str] = None) -> Dict[str, Any]:
@@ -428,6 +435,81 @@ class MeasurementService:
                     normalized_ssid,
                     "",
                     {},
+                    round((time.monotonic() - started_monotonic) * 1000),
+                    "failed",
+                    str(exc),
+                )
+                raise
+
+    def fix_local_ap(self) -> Dict[str, Any]:
+        if IS_WINDOWS:
+            raise RuntimeError("AP locking is available on Jetson/Linux only")
+        with self._lock:
+            config = self._config
+            enabled_ssid = self._bssid_switch_enabled_ssid
+        use_sudo = config.use_sudo if config and config.measurement_mode == "local" else DEFAULT_USE_SUDO
+        with self._network_switch_lock:
+            current = get_current_local_wifi_state(use_sudo)
+            if not enabled_ssid or str(current.get("ssid", "")).strip() != enabled_ssid:
+                raise RuntimeError("Switch the AP before fixing it")
+            started_at = dt.datetime.now().isoformat(timespec="seconds")
+            started_monotonic = time.monotonic()
+            try:
+                lock_info = set_local_wifi_ap_lock(use_sudo, True)
+                self._write_connection_event(
+                    started_at,
+                    "ap_lock",
+                    enabled_ssid,
+                    "",
+                    current,
+                    round((time.monotonic() - started_monotonic) * 1000),
+                    "success",
+                    f"connection={lock_info.get('connection', '')};priority={lock_info.get('priority', '')}",
+                )
+                return {"ok": True, "connected": current, "ap_lock": lock_info}
+            except Exception as exc:  # noqa: BLE001
+                self._write_connection_event(
+                    started_at,
+                    "ap_lock",
+                    enabled_ssid,
+                    "",
+                    current,
+                    round((time.monotonic() - started_monotonic) * 1000),
+                    "failed",
+                    str(exc),
+                )
+                raise
+
+    def clear_local_ap_fix(self) -> Dict[str, Any]:
+        if IS_WINDOWS:
+            raise RuntimeError("AP locking is available on Jetson/Linux only")
+        with self._lock:
+            config = self._config
+        use_sudo = config.use_sudo if config and config.measurement_mode == "local" else DEFAULT_USE_SUDO
+        with self._network_switch_lock:
+            current = get_current_local_wifi_state(use_sudo)
+            started_at = dt.datetime.now().isoformat(timespec="seconds")
+            started_monotonic = time.monotonic()
+            try:
+                lock_info = set_local_wifi_ap_lock(use_sudo, False)
+                self._write_connection_event(
+                    started_at,
+                    "ap_unlock",
+                    str(current.get("ssid", "")),
+                    "",
+                    current,
+                    round((time.monotonic() - started_monotonic) * 1000),
+                    "success",
+                    f"connection={lock_info.get('connection', '')};priority={lock_info.get('priority', '')}",
+                )
+                return {"ok": True, "connected": current, "ap_lock": lock_info}
+            except Exception as exc:  # noqa: BLE001
+                self._write_connection_event(
+                    started_at,
+                    "ap_unlock",
+                    str(current.get("ssid", "")),
+                    "",
+                    current,
                     round((time.monotonic() - started_monotonic) * 1000),
                     "failed",
                     str(exc),

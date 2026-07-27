@@ -43,6 +43,8 @@ const bssidSwitchSelect = document.getElementById("bssid-switch-select");
 const refreshBssidBtn = document.getElementById("refresh-bssid-btn");
 const bssidSwitchConfirm = document.getElementById("bssid-switch-confirm");
 const switchApBtn = document.getElementById("switch-ap-btn");
+const fixApBtn = document.getElementById("fix-ap-btn");
+const clearApFixBtn = document.getElementById("clear-ap-fix-btn");
 const switchBssidBtn = document.getElementById("switch-bssid-btn");
 const fixBssidBtn = document.getElementById("fix-bssid-btn");
 const clearBssidFixBtn = document.getElementById("clear-bssid-fix-btn");
@@ -67,6 +69,7 @@ const state = {
   currentWifi: {},
   bssidSwitchEnabledSsid: "",
   bssidLock: {},
+  apLock: {},
   bands: {},
   ssidOptions: [],
   timezoneOptions: [],
@@ -200,6 +203,12 @@ function attachEvents() {
   }
   if (switchApBtn) {
     switchApBtn.addEventListener("click", handleApSwitch);
+  }
+  if (fixApBtn) {
+    fixApBtn.addEventListener("click", handleApFix);
+  }
+  if (clearApFixBtn) {
+    clearApFixBtn.addEventListener("click", handleClearApFix);
   }
   if (switchBssidBtn) {
     switchBssidBtn.addEventListener("click", handleBssidSwitch);
@@ -352,6 +361,8 @@ function syncBssidSwitchState() {
   if (apSwitchSelect) apSwitchSelect.disabled = !isAvailable;
   if (apSwitchPassword) apSwitchPassword.disabled = !isAvailable;
   if (switchApBtn) switchApBtn.disabled = !isAvailable || !hasApCandidate || !confirmed;
+  if (fixApBtn) fixApBtn.disabled = !bssidTestEnabled || !confirmed;
+  if (clearApFixBtn) clearApFixBtn.disabled = !isAvailable || state.apLock?.locked !== "yes" || !confirmed;
   if (bssidSwitchSelect) bssidSwitchSelect.disabled = !bssidTestEnabled;
   if (switchBssidBtn) switchBssidBtn.disabled = !bssidTestEnabled || !state.running || !hasCandidate || !confirmed;
   if (fixBssidBtn) fixBssidBtn.disabled = !bssidTestEnabled || !state.running || !confirmed;
@@ -384,6 +395,7 @@ async function loadAccessPointCandidates() {
     state.currentWifi = data.current || {};
     state.bssidSwitchEnabledSsid = data.bssid_switch_enabled_ssid || "";
     state.bssidLock = data.bssid_lock || {};
+    state.apLock = data.ap_lock || {};
     const accessPoints = data.access_points || [];
     const ssids = [...new Set(accessPoints.map((ap) => ap.ssid).filter(Boolean))].sort();
     setSelectOptions(
@@ -405,7 +417,9 @@ async function loadAccessPointCandidates() {
       "同一SSID内のBSSIDを選択",
     );
     if (apSwitchStatus) {
-      apSwitchStatus.textContent = `現在: ${currentSsid || "-"} / ${state.currentWifi.bssid || "-"}`;
+      apSwitchStatus.textContent = state.apLock.locked === "yes"
+        ? `AP固定中: ${state.apLock.ssid || currentSsid || "-"} (${state.apLock.connection || "接続プロファイル"})`
+        : `現在: ${currentSsid || "-"} / ${state.currentWifi.bssid || "-"}`;
     }
     if (bssidSwitchStatus) {
       bssidSwitchStatus.textContent = state.bssidLock.bssid
@@ -444,6 +458,50 @@ async function handleApSwitch() {
     if (apSwitchPassword) apSwitchPassword.value = "";
     if (apSwitchStatus) apSwitchStatus.textContent = `AP切替完了: ${data.connected?.ssid || ssid}`;
     await loadAccessPointCandidates();
+  } catch (error) {
+    if (apSwitchStatus) apSwitchStatus.textContent = error.message;
+  } finally {
+    syncBssidSwitchState();
+  }
+}
+
+async function handleApFix() {
+  if (!bssidSwitchConfirm?.checked) return;
+  if (!window.confirm("現在接続中のAP（SSID）を自動接続の最優先に固定します。")) return;
+  try {
+    if (fixApBtn) fixApBtn.disabled = true;
+    if (apSwitchStatus) apSwitchStatus.textContent = "APを固定中...";
+    const response = await fetch("/api/local/fix-ap", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ acknowledged_usb_or_lan: true }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "AP固定に失敗しました");
+    state.apLock = data.ap_lock || {};
+    if (apSwitchStatus) apSwitchStatus.textContent = `APを固定しました: ${state.apLock.ssid || "-"}`;
+  } catch (error) {
+    if (apSwitchStatus) apSwitchStatus.textContent = error.message;
+  } finally {
+    syncBssidSwitchState();
+  }
+}
+
+async function handleClearApFix() {
+  if (!bssidSwitchConfirm?.checked) return;
+  if (!window.confirm("APの自動接続優先を通常値へ戻します。")) return;
+  try {
+    if (clearApFixBtn) clearApFixBtn.disabled = true;
+    if (apSwitchStatus) apSwitchStatus.textContent = "AP固定を解除中...";
+    const response = await fetch("/api/local/clear-ap-fix", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ acknowledged_usb_or_lan: true }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "AP固定の解除に失敗しました");
+    state.apLock = data.ap_lock || {};
+    if (apSwitchStatus) apSwitchStatus.textContent = "AP固定を解除しました。";
   } catch (error) {
     if (apSwitchStatus) apSwitchStatus.textContent = error.message;
   } finally {

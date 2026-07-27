@@ -274,6 +274,26 @@ async def fix_local_bssid(payload: BssidLockRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/local/fix-ap")
+async def fix_local_ap(payload: BssidLockRequest):
+    if not payload.acknowledged_usb_or_lan:
+        raise HTTPException(status_code=400, detail="Confirm that the dashboard is connected through USB or wired LAN")
+    try:
+        return service.fix_local_ap()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/local/clear-ap-fix")
+async def clear_local_ap_fix(payload: BssidLockRequest):
+    if not payload.acknowledged_usb_or_lan:
+        raise HTTPException(status_code=400, detail="Confirm that the dashboard is connected through USB or wired LAN")
+    try:
+        return service.clear_local_ap_fix()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/local/clear-bssid-fix")
 async def clear_local_bssid_fix(payload: BssidLockRequest):
     if not payload.acknowledged_usb_or_lan:

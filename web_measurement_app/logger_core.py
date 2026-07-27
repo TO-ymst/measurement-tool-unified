@@ -819,6 +819,59 @@ def set_local_wifi_bssid_lock(use_sudo: bool, bssid: Optional[str]) -> Dict[str,
     return updated_lock
 
 
+def get_local_wifi_ap_lock(use_sudo: bool) -> Dict[str, str]:
+    if IS_WINDOWS:
+        raise RuntimeError("AP locking is supported on Jetson/Linux only")
+    connection_info = get_local_wifi_bssid_lock(use_sudo)
+    values = _run_local_nmcli(
+        use_sudo,
+        [
+            "-g",
+            "802-11-wireless.ssid,connection.autoconnect,connection.autoconnect-priority",
+            "connection",
+            "show",
+            "id",
+            connection_info["connection"],
+        ],
+    ).splitlines()
+    ssid = values[0].strip() if len(values) > 0 else ""
+    autoconnect = values[1].strip().lower() if len(values) > 1 else ""
+    priority = values[2].strip() if len(values) > 2 else "0"
+    try:
+        priority_value = int(priority or "0")
+    except ValueError:
+        priority_value = 0
+    return {
+        "connection": connection_info["connection"],
+        "ssid": ssid,
+        "priority": str(priority_value),
+        "locked": "yes" if autoconnect == "yes" and priority_value >= 100 else "no",
+    }
+
+
+def set_local_wifi_ap_lock(use_sudo: bool, locked: bool) -> Dict[str, str]:
+    if IS_WINDOWS:
+        raise RuntimeError("AP locking is supported on Jetson/Linux only")
+    current_lock = get_local_wifi_ap_lock(use_sudo)
+    _run_local_nmcli(
+        use_sudo,
+        [
+            "connection",
+            "modify",
+            "id",
+            current_lock["connection"],
+            "connection.autoconnect",
+            "yes",
+            "connection.autoconnect-priority",
+            "100" if locked else "0",
+        ],
+    )
+    updated_lock = get_local_wifi_ap_lock(use_sudo)
+    if (updated_lock["locked"] == "yes") != locked:
+        raise RuntimeError("AP lock verification failed")
+    return updated_lock
+
+
 def get_ping_result(
     target_ip: str,
     timeout_as_numeric: bool,
