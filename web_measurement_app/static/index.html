@@ -1,0 +1,311 @@
+﻿<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Wi-Fi Measurement Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260305_1" />
+  </head>
+  <body>
+    <header>
+      <h1>Wi-Fi Measurement Dashboard</h1>
+      <div class="status-line">
+        <span id="status-indicator" class="status-badge idle">Idle</span>
+        <span id="status-message">読み込み中...</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="panel">
+        <h2>測定パラメータ</h2>
+        <form id="config-form">
+          <div class="form-grid">
+            <label>測定方式
+              <select name="measurement_mode" id="measurement-mode-select">
+                <option value="local">ローカル</option>
+                <option value="remote_ssh">Jetson(SSH)</option>
+              </select>
+            </label>
+            <label>SSID
+              <input type="text" name="ssid" list="ssid-options" placeholder="対象SSID" required />
+              <datalist id="ssid-options"></datalist>
+            </label>
+            <label>バンド
+              <select name="band" id="band-select">
+                <option value="2.4GHz">2.4GHz</option>
+                <option value="5GHz">5GHz</option>
+                <option value="6GHz">6GHz</option>
+              </select>
+            </label>
+            <label>Channel Min
+              <input type="number" name="channel_min" min="1" />
+            </label>
+            <label>Channel Max
+              <input type="number" name="channel_max" min="1" />
+            </label>
+            <label>ログ Prefix
+              <input type="text" name="prefix" placeholder="例: buildingA_" />
+            </label>
+            <label>ログ Base 名
+              <input type="text" name="log_base" />
+            </label>
+            <label>出力ディレクトリ
+              <input type="text" name="output_dir" value="." />
+            </label>
+            <label>スキャン間隔 (秒)
+              <input type="number" step="0.1" min="0.1" name="interval" />
+            </label>
+            <label>Wi-Fi未接続時代替値
+              <input type="number" name="wifi_disconnected_value" />
+            </label>
+            <label>Ping失敗時代替値
+              <input type="number" name="ping_fail_value" />
+            </label>
+            <label>Pingタイムアウト (ms)
+              <input type="number" name="ping_timeout_ms" min="1" max="60000" step="1" />
+            </label>
+            <label>タイムゾーン
+              <input type="text" name="timezone" id="timezone-select" />
+            </label>
+            <label>保持行数
+              <input type="number" name="retain_rows" min="1000" max="200000" value="20000" />
+            </label>
+          </div>
+
+          <section class="config-section local-config-section" id="local-config-section">
+            <div class="config-section-header">
+              <h3>ローカル測定設定</h3>
+              <p>このPCで Wi-Fi 情報と Ping を取得します。</p>
+            </div>
+            <div class="form-flags local-config-flags">
+              <label><input type="checkbox" name="auto_gateway" checked /> Gateway自動検出</label>
+              <label><input type="checkbox" name="timeout_as_numeric" checked /> タイムアウトを数値で記録</label>
+              <label><input type="checkbox" name="use_sudo" checked /> nmcliにsudoを使用</label>
+              <label><input type="checkbox" name="sync_time" checked /> 測定中のみ時刻同期 (timedatectl)</label>
+            </div>
+          </section>
+
+          <section class="config-section remote-config-section" id="remote-config-section">
+            <div class="config-section-header">
+              <h3>Jetson リモート設定</h3>
+              <p>WinPC から SSH で Jetson に接続して測定します。</p>
+            </div>
+            <div class="form-grid remote-config-grid">
+              <label>Jetsonホスト
+                <input type="text" name="remote_host" id="remote-host" placeholder="例: 10.42.0.1" />
+              </label>
+              <label>SSHユーザー
+                <input type="text" name="remote_user" id="remote-user" placeholder="例: triorb" />
+              </label>
+              <label>SSHポート
+                <input type="number" name="remote_port" id="remote-port" min="1" max="65535" value="22" />
+              </label>
+              <label>秘密鍵パス
+                <input type="text" name="remote_identity_file" id="remote-identity-file" placeholder="未指定なら ~/.ssh/id_ed25519" />
+              </label>
+            </div>
+            <div class="form-flags remote-config-flags">
+              <label><input type="checkbox" name="remote_setup_ssh_key" checked /> 開始時にSSH鍵を登録</label>
+              <label><input type="checkbox" name="remote_cleanup_ssh_key" checked /> 停止時にSSH鍵を削除</label>
+              <label><input type="checkbox" name="remote_delete_local_key" checked /> 停止時にローカル鍵も削除</label>
+            </div>
+            <label>SSH鍵コメント
+              <input type="text" name="remote_ssh_key_comment" id="remote-ssh-key-comment" placeholder="未指定で自動コメント" />
+            </label>
+            <div class="remote-actions">
+              <button type="button" id="remote-prepare-btn">Jetson接続準備</button>
+            </div>
+            <details class="advanced-panel">
+              <summary>障害解析ログ</summary>
+              <p class="hint">
+                通常CSVはそのまま保存し、異常時だけ追加の詳細ログを別 JSONL に保存します。
+              </p>
+              <div class="form-flags remote-config-flags">
+                <label><input type="checkbox" name="remote_advanced_enabled" /> 障害解析ログを有効化</label>
+                <label><input type="checkbox" name="remote_advanced_snapshot_on_ping_timeout" /> Ping欠落連続時に採取</label>
+                <label><input type="checkbox" name="remote_advanced_snapshot_on_bssid_change" /> BSSID変化時に採取</label>
+                <label><input type="checkbox" name="remote_advanced_include_neighbor" /> ARP全文 (ip neigh show)</label>
+                <label><input type="checkbox" name="remote_advanced_include_routes" /> ip route</label>
+                <label><input type="checkbox" name="remote_advanced_include_ip_addr" /> ip addr/link</label>
+                <label><input type="checkbox" name="remote_advanced_include_wifi_details" /> iw / nmcli 詳細</label>
+                <label><input type="checkbox" name="remote_advanced_include_journal" /> journalctl</label>
+              </div>
+              <div class="form-grid remote-config-grid">
+                <label>Ping欠落連続回数
+                  <input type="number" name="remote_advanced_ping_timeout_streak" min="1" max="20" value="1" />
+                </label>
+                <label>採取出力の最大文字数
+                  <input type="number" name="remote_advanced_max_output_chars" min="200" max="200000" value="12000" />
+                </label>
+              </div>
+            </details>
+          </section>
+          <section class="config-section">
+            <div class="config-section-header">
+              <h3>ネイバー測定設定</h3>
+              <p>ローカル測定とJetson(SSH)測定のどちらでも、検出したAP一覧を別CSVに記録します。</p>
+            </div>
+            <div class="form-grid">
+              <label>ネイバースキャン間隔
+                <input type="number" name="remote_neighbor_every" id="remote-neighbor-every" min="0" value="5" />
+              </label>
+              <label>対象SSID
+                <input type="text" name="remote_neighbor_ssid" id="remote-neighbor-ssid" placeholder="未指定なら接続中SSID" />
+              </label>
+            </div>
+            <div class="form-flags">
+              <label><input type="checkbox" name="remote_enable_neighbor_scan" checked /> ネイバースキャンを取得</label>
+            </div>
+          </section>
+          <label>Pingターゲット
+            <input type="text" name="ping_target" id="ping-target" placeholder="IPまたはホスト名" />
+            <small class="hint" id="ping-target-hint">Gateway自動検出ON時は入力不可です。</small>
+          </label>
+          <div class="actions">
+            <button type="button" id="start-btn">測定開始</button>
+            <button type="button" id="stop-btn" disabled>停止</button>
+          </div>
+        </form>
+        <div class="log-info">
+          <p>ログファイル: <span id="log-path">-</span></p>
+          <p>ネイバー詳細ログ: <span id="neighbor-log-path">-</span></p>
+          <p>障害解析ログ: <span id="advanced-log-path">-</span></p>
+          <p>Ping Target: <span id="ping-details">-</span></p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>マップとプロット</h2>
+        <div class="map-toolbar">
+          <div>
+            <label class="file-input">
+              背景画像を読み込む
+              <input type="file" id="map-file" accept="image/*" />
+            </label>
+            <button type="button" id="reset-map">マップ初期化</button>
+            <button type="button" id="undo-point-btn">最後の打点を取り消す</button>
+          </div>
+          <div class="mode-switch">
+            <label><input type="radio" name="mode" value="ping" checked /> Ping (0-30ms)</label>
+            <label><input type="radio" name="mode" value="ping_levels" /> Ping (4-Levels)</label>
+            <label><input type="radio" name="mode" value="ping_300" /> Ping (0-300ms)</label>
+            <label><input type="radio" name="mode" value="signal" /> Signal (%)</label>
+            <label><input type="radio" name="mode" value="rssi" /> RSSI (dBm)</label>
+            <label><input type="radio" name="mode" value="bssid" /> BSSID</label>
+            <label><input type="radio" name="mode" value="best_neighbor_rssi" /> Best Neighbor RSSI</label>
+            <label><input type="radio" name="mode" value="best_neighbor_bssid" /> Best Neighbor BSSID</label>
+          </div>
+        </div>
+
+        <div class="import-toolbar">
+          <label class="file-input">
+            JetsonログCSV(Point)
+            <input type="file" id="point-csv-file" accept=".csv,text/csv" />
+          </label>
+          <button type="button" id="import-point-btn">Point列でプロット</button>
+          <label class="file-input">
+            PCログCSV
+            <input type="file" id="reference-csv-file" accept=".csv,text/csv" />
+          </label>
+          <label class="file-input">
+            JetsonログCSV
+            <input type="file" id="overlay-csv-file" accept=".csv,text/csv" />
+          </label>
+          <label>
+            時刻許容差(ms)
+            <input type="number" id="import-tolerance-ms" min="0" step="100" value="2000" />
+          </label>
+          <button type="button" id="import-aligned-btn">時刻照合してプロット</button>
+        </div>
+
+        <div class="display-controls">
+          <div class="control-block">
+            <p>ポイント表示サイズ (文字)</p>
+            <div class="control-pair">
+              <input type="number" id="label-size-number" min="1" max="1000" value="14" />
+              <input type="range" id="label-size-range" min="1" max="1000" value="14" />
+            </div>
+          </div>
+          <div class="control-block">
+            <p>ポイントマーカー半径</p>
+            <div class="control-pair">
+              <input type="number" id="anchor-radius-number" min="1" max="1000" value="5" />
+              <input type="range" id="anchor-radius-range" min="1" max="1000" value="5" />
+            </div>
+          </div>
+          <div class="control-block">
+            <p>プロット点半径</p>
+            <div class="control-pair">
+              <input type="number" id="plot-radius-number" min="1" max="1000" value="3" />
+              <input type="range" id="plot-radius-range" min="1" max="1000" value="3" />
+            </div>
+          </div>
+          <div class="control-block">
+            <p>プロット形状</p>
+            <select id="plot-shape-select">
+              <option value="dot">丸点</option>
+              <option value="strip">短冊</option>
+            </select>
+          </div>
+          <div class="control-block">
+            <p>ポイント表示カラー</p>
+            <input type="color" id="label-color" value="#ff5de4" />
+          </div>
+          <div class="control-block grayscale">
+            <label class="grayscale-toggle">
+              <input type="checkbox" id="grayscale-toggle" />
+              背景をグレースケール化
+            </label>
+            <input type="range" id="grayscale-range" min="0" max="100" value="100" disabled />
+          </div>
+        </div>
+
+        <div class="map-legend-layout">
+          <div class="map-wrapper">
+            <div class="map-zoom-controls map-zoom-controls-inline">
+              <button type="button" id="zoom-out-btn">-</button>
+              <button type="button" id="zoom-in-btn">+</button>
+              <button type="button" id="zoom-reset-btn">100%</button>
+              <label class="pan-toggle" for="pan-mode-toggle">
+                <input type="checkbox" id="pan-mode-toggle" />
+                <span>表示位置調整</span>
+              </label>
+            </div>
+            <canvas id="map-canvas" width="1200" height="720"></canvas>
+          </div>
+          <div class="legend-column">
+            <label class="legend-toggle">
+              <input type="checkbox" id="legend-toggle" checked />
+              レジェンドを表示
+            </label>
+            <div id="legend-container" class="legend-container"></div>
+          </div>
+        </div>
+
+        <div class="export-controls">
+          <label>
+            画像タイトル
+            <input type="text" id="export-title" placeholder="例: 5F 西側" />
+          </label>
+          <label class="export-toggle">
+            <input type="checkbox" id="title-toggle" checked />
+            タイトルを画像に含める
+          </label>
+          <button type="button" id="export-btn">プロット画像を書き出す</button>
+          <button type="button" id="export-all-btn">全レジェンド画像を書き出す</button>
+        </div>
+
+        <p class="hint">
+          クリックで P1, P2 ... を順番に配置します。2点目以降をクリックすると直前ポイントの区間が確定し、ログの Point 列に対応した計測結果が即座にプロットされます。
+        </p>
+      </section>
+
+      <section class="panel">
+        <h2>リアルタイムログ</h2>
+        <div id="live-log"></div>
+      </section>
+    </main>
+
+    <script defer src="/static/app.js?v=20260305_1"></script>
+  </body>
+</html>
