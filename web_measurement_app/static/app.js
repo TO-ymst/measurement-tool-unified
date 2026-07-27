@@ -2111,6 +2111,43 @@ function buildExportCanvas(modeKey, baseTitle) {
   return { canvas: tempCanvas, modeLabel };
 }
 
+const MAX_EXPORT_DIMENSION = 8192;
+const MAX_EXPORT_PIXELS = 64 * 1024 * 1024;
+
+function getSafeExportScale(width, height) {
+  if (!width || !height) return 0;
+  return Math.min(
+    1,
+    MAX_EXPORT_DIMENSION / width,
+    MAX_EXPORT_DIMENSION / height,
+    Math.sqrt(MAX_EXPORT_PIXELS / (width * height)),
+  );
+}
+
+function downloadCanvasPng(exportCanvas, filename, successMessage) {
+  if (!exportCanvas?.width || !exportCanvas?.height) {
+    statusMessage.textContent = "画像の生成に失敗しました。";
+    return;
+  }
+  try {
+    exportCanvas.toBlob((blob) => {
+      if (!blob || !blob.size) {
+        statusMessage.textContent = "PNGを生成できませんでした。出力サイズを小さくして再試行してください。";
+        return;
+      }
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      if (successMessage) statusMessage.textContent = successMessage;
+    }, "image/png");
+  } catch (error) {
+    statusMessage.textContent = `PNGを生成できませんでした: ${error.message}`;
+  }
+}
+
 function exportPlotImage(options = {}) {
   if (!canvas) return;
   const baseTitle = (options.filePrefix || exportTitleInput?.value || "").trim();
@@ -2121,13 +2158,10 @@ function exportPlotImage(options = {}) {
     return;
   }
 
-  const link = document.createElement("a");
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const safeTitle = baseTitle ? sanitizeFileName(baseTitle) : "plot";
   const modeToken = sanitizeFileName(modeKey.replace(/_/g, "-"));
-  link.href = exportData.canvas.toDataURL("image/png");
-  link.download = `${safeTitle}_${modeToken}_${timestamp}.png`;
-  link.click();
+  downloadCanvasPng(exportData.canvas, `${safeTitle}_${modeToken}_${timestamp}.png`, "画像を書き出しました。");
 }
 
 function hasAnyBestNeighborData() {
@@ -2173,14 +2207,21 @@ function exportAllLegendImages() {
 
   const cols = 2;
   const rows = Math.max(...cards.map((card) => card.row)) + 1;
-  // Keep full quality for each mode tile (no downscale before sheet export).
-  const scale = 1.0;
-  const gapX = 24;
-  const gapY = 24;
-  const margin = 40;
-  const titleHeight = 90;
-  const tileWidth = Math.round(Math.max(...cards.map((card) => card.canvas.width)) * scale);
-  const tileHeight = Math.round(Math.max(...cards.map((card) => card.canvas.height)) * scale);
+  const rawTileWidth = Math.max(...cards.map((card) => card.canvas.width));
+  const rawTileHeight = Math.max(...cards.map((card) => card.canvas.height));
+  const rawWidth = 80 + cols * rawTileWidth + (cols - 1) * 24;
+  const rawHeight = 80 + 90 + rows * rawTileHeight + (rows - 1) * 24;
+  const scale = getSafeExportScale(rawWidth, rawHeight);
+  if (!scale) {
+    statusMessage.textContent = "画像の生成に失敗しました。";
+    return;
+  }
+  const gapX = Math.max(8, Math.round(24 * scale));
+  const gapY = Math.max(8, Math.round(24 * scale));
+  const margin = Math.max(16, Math.round(40 * scale));
+  const titleHeight = Math.max(36, Math.round(90 * scale));
+  const tileWidth = Math.max(1, Math.round(rawTileWidth * scale));
+  const tileHeight = Math.max(1, Math.round(rawTileHeight * scale));
   const sheetWidth = margin * 2 + cols * tileWidth + (cols - 1) * gapX;
   const sheetHeight = margin * 2 + titleHeight + rows * tileHeight + (rows - 1) * gapY;
 
@@ -2200,7 +2241,7 @@ function exportAllLegendImages() {
 
   const title = `${prefix} all-modes`;
   sctx.fillStyle = "#f7f7fb";
-  sctx.font = "600 42px 'Segoe UI', 'Helvetica Neue', sans-serif";
+  sctx.font = `600 ${Math.max(18, Math.round(42 * scale))}px 'Segoe UI', 'Helvetica Neue', sans-serif`;
   sctx.textAlign = "left";
   sctx.textBaseline = "top";
   sctx.fillText(title, margin, margin);
@@ -2211,13 +2252,14 @@ function exportAllLegendImages() {
     sctx.drawImage(card.canvas, x, y, tileWidth, tileHeight);
   });
 
-  const link = document.createElement("a");
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const safePrefix = sanitizeFileName(prefix);
-  link.href = sheet.toDataURL("image/png");
-  link.download = `${safePrefix}_all-modes_${timestamp}.png`;
-  link.click();
-  statusMessage.textContent = "全モードのレジェンド付きプロット画像を書き出しました。";
+  const resizeNote = scale < 0.999 ? "（ブラウザ上限に合わせて縮小）" : "";
+  downloadCanvasPng(
+    sheet,
+    `${safePrefix}_all-modes_${timestamp}.png`,
+    `全モードのレジェンド付きプロット画像を書き出しました。${resizeNote}`,
+  );
 }
 function sanitizeFileName(name) {
   return name.replace(/[\\/:*?"<>|]/g, "_") || "plot";
