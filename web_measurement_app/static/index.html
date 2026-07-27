@@ -19,20 +19,22 @@
       <section class="panel">
         <h2>測定設定</h2>
         <form id="config-form">
-          <section class="config-section local-config-section" id="local-config-section">
+          <section class="config-section flow-mode-selection">
             <div class="config-section-header">
-              <h3>ローカル測定設定</h3>
-              <p>このPCで Wi-Fi 情報と Ping を取得します。</p>
+              <h3>測定方式</h3>
+              <p>ローカル測定またはJetson(SSH)測定を選択します。</p>
             </div>
-            <div class="form-flags local-config-flags">
-              <label><input type="checkbox" name="auto_gateway" checked /> Gateway自動検出</label>
-              <label><input type="checkbox" name="timeout_as_numeric" checked /> タイムアウトを数値で記録</label>
-              <label><input type="checkbox" name="use_sudo" checked /> nmcliにsudoを使用</label>
-              <label><input type="checkbox" name="sync_time" checked /> 測定中のみ時刻同期 (timedatectl)</label>
+            <div class="form-grid">
+              <label>測定方式
+                <select name="measurement_mode" id="measurement-mode-select">
+                  <option value="local">ローカル</option>
+                  <option value="remote_ssh">Jetson(SSH)</option>
+                </select>
+              </label>
             </div>
           </section>
 
-          <section class="config-section" id="bssid-switch-section">
+          <section class="config-section flow-ap-switch" id="bssid-switch-section">
             <div class="config-section-header">
               <h3>Jetson AP切替 / BSSIDテスト</h3>
               <p>通常はSSIDだけを切り替えます。BSSID操作はAP切替後の同一SSID内テスト用です。</p>
@@ -65,7 +67,7 @@
             <small class="hint" id="bssid-switch-status">BSSID切替は、AP切替後かつローカル測定中にだけ実行できます。</small>
           </section>
 
-          <section class="config-section remote-config-section" id="remote-config-section">
+          <section class="config-section remote-config-section flow-remote-config" id="remote-config-section">
             <div class="config-section-header">
               <h3>Jetson リモート設定</h3>
               <p>WinPC から SSH で Jetson に接続して測定します。</p>
@@ -120,18 +122,12 @@
               </div>
             </details>
           </section>
-          <section class="config-section">
+          <section class="config-section flow-measurement-parameters">
             <div class="config-section-header">
               <h3>測定パラメータ</h3>
               <p>接続条件、ログ出力、測定間隔を設定します。</p>
             </div>
             <div class="form-grid">
-              <label>測定方式
-                <select name="measurement_mode" id="measurement-mode-select">
-                  <option value="local">ローカル</option>
-                  <option value="remote_ssh">Jetson(SSH)</option>
-                </select>
-              </label>
               <label>SSID
                 <input type="text" name="ssid" list="ssid-options" placeholder="対象SSID" required />
                 <datalist id="ssid-options"></datalist>
@@ -178,7 +174,19 @@
               </label>
             </div>
           </section>
-          <section class="config-section">
+          <section class="config-section local-config-section flow-local-config" id="local-config-section">
+            <div class="config-section-header">
+              <h3>ローカル測定設定</h3>
+              <p>このPCで Wi-Fi 情報と Ping を取得します。</p>
+            </div>
+            <div class="form-flags local-config-flags">
+              <label><input type="checkbox" name="auto_gateway" checked /> Gateway自動検出</label>
+              <label><input type="checkbox" name="timeout_as_numeric" checked /> タイムアウトを数値で記録</label>
+              <label><input type="checkbox" name="use_sudo" checked /> nmcliにsudoを使用</label>
+              <label><input type="checkbox" name="sync_time" checked /> 測定中のみ時刻同期 (timedatectl)</label>
+            </div>
+          </section>
+          <section class="config-section flow-neighbor-config">
             <div class="config-section-header">
               <h3>ネイバー測定設定</h3>
               <p>ローカル測定とJetson(SSH)測定のどちらでも、検出したAP一覧を別CSVに記録します。</p>
@@ -195,11 +203,11 @@
               <label><input type="checkbox" name="remote_enable_neighbor_scan" checked /> ネイバースキャンを取得</label>
             </div>
           </section>
-          <label>Pingターゲット
+          <label class="flow-ping-target">Pingターゲット
             <input type="text" name="ping_target" id="ping-target" placeholder="IPまたはホスト名" />
             <small class="hint" id="ping-target-hint">Gateway自動検出ON時は入力不可です。</small>
           </label>
-          <div class="actions">
+          <div class="actions flow-measurement-actions">
             <button type="button" id="start-btn">測定開始</button>
             <button type="button" id="stop-btn" disabled>停止</button>
           </div>
