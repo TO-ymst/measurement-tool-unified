@@ -724,6 +724,36 @@ def get_current_local_wifi_state(use_sudo: bool) -> Dict[str, object]:
     return rows[0] if rows else {}
 
 
+def _run_local_nmcli(use_sudo: bool, args: List[str], timeout: int = 35) -> str:
+    cmd = ["nmcli", *args]
+    if use_sudo:
+        cmd.insert(0, "sudo")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
+    except FileNotFoundError as exc:
+        raise RuntimeError("nmcli command was not found") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("nmcli operation timed out") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "nmcli operation failed").strip()
+        raise RuntimeError(detail)
+    return result.stdout
+
+
+def switch_local_wifi_ssid(use_sudo: bool, ssid: str) -> Dict[str, object]:
+    if IS_WINDOWS:
+        raise RuntimeError("AP switching is supported on Jetson/Linux only")
+    normalized_ssid = ssid.strip()
+    if not normalized_ssid:
+        raise RuntimeError("SSID is required")
+
+    _run_local_nmcli(use_sudo, ["--wait", "30", "device", "wifi", "connect", normalized_ssid])
+    connected = get_current_local_wifi_state(use_sudo)
+    if str(connected.get("ssid", "")).strip() != normalized_ssid:
+        raise RuntimeError("Connected SSID verification failed")
+    return connected
+
+
 def switch_local_wifi_bssid(use_sudo: bool, ssid: str, bssid: str) -> Dict[str, object]:
     if IS_WINDOWS:
         raise RuntimeError("BSSID switching is supported on Jetson/Linux only")
@@ -734,24 +764,56 @@ def switch_local_wifi_bssid(use_sudo: bool, ssid: str, bssid: str) -> Dict[str, 
     if not re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", normalized_bssid):
         raise RuntimeError("Invalid BSSID format")
 
-    cmd = ["nmcli", "--wait", "30", "device", "wifi", "connect", normalized_ssid, "bssid", normalized_bssid]
-    if use_sudo:
-        cmd.insert(0, "sudo")
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=35)
-    except FileNotFoundError as exc:
-        raise RuntimeError("nmcli command was not found") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("BSSID switch timed out") from exc
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "nmcli connection failed").strip()
-        raise RuntimeError(detail)
+    _run_local_nmcli(
+        use_sudo,
+        ["--wait", "30", "device", "wifi", "connect", normalized_ssid, "bssid", normalized_bssid],
+    )
 
     connected = get_current_local_wifi_state(use_sudo)
     actual_bssid = str(connected.get("bssid", "")).lower()
     if actual_bssid != normalized_bssid:
         raise RuntimeError(f"Connected BSSID verification failed: {actual_bssid or 'not connected'}")
     return connected
+
+
+def get_local_wifi_bssid_lock(use_sudo: bool) -> Dict[str, str]:
+    if IS_WINDOWS:
+        raise RuntimeError("BSSID locking is supported on Jetson/Linux only")
+    device_output = _run_local_nmcli(use_sudo, ["-t", "-f", "DEVICE,TYPE,STATE", "device", "status"])
+    wifi_device = ""
+    for line in device_output.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) == 3 and parts[1] == "wifi" and parts[2] == "connected":
+            wifi_device = parts[0]
+            break
+    if not wifi_device:
+        raise RuntimeError("No connected Wi-Fi device was found")
+
+    connection = _run_local_nmcli(use_sudo, ["-g", "GENERAL.CONNECTION", "device", "show", wifi_device]).strip()
+    if not connection or connection == "--":
+        raise RuntimeError("No active Wi-Fi connection profile was found")
+    locked_bssid = _run_local_nmcli(
+        use_sudo,
+        ["-g", "802-11-wireless.bssid", "connection", "show", "id", connection],
+    ).strip().lower()
+    return {"connection": connection, "bssid": locked_bssid}
+
+
+def set_local_wifi_bssid_lock(use_sudo: bool, bssid: Optional[str]) -> Dict[str, str]:
+    if IS_WINDOWS:
+        raise RuntimeError("BSSID locking is supported on Jetson/Linux only")
+    normalized_bssid = (bssid or "").strip().lower()
+    if normalized_bssid and not re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", normalized_bssid):
+        raise RuntimeError("Invalid BSSID format")
+    current_lock = get_local_wifi_bssid_lock(use_sudo)
+    _run_local_nmcli(
+        use_sudo,
+        ["connection", "modify", "id", current_lock["connection"], "802-11-wireless.bssid", normalized_bssid],
+    )
+    updated_lock = get_local_wifi_bssid_lock(use_sudo)
+    if updated_lock["bssid"] != normalized_bssid:
+        raise RuntimeError("BSSID lock verification failed")
+    return updated_lock
 
 
 def get_ping_result(

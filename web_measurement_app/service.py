@@ -43,6 +43,7 @@ from .logger_core import (
     fetch_remote_wifi_state,
     fetch_wifi_rows,
     get_current_local_wifi_state,
+    get_local_wifi_bssid_lock,
     get_ping_result,
     IS_WINDOWS,
     prepare_connection_event_file,
@@ -53,7 +54,9 @@ from .logger_core import (
     remove_remote_ssh_key,
     resolve_ping_target,
     scan_local_neighbors,
+    set_local_wifi_bssid_lock,
     should_run_neighbor_scan,
+    switch_local_wifi_ssid,
     switch_local_wifi_bssid,
 )
 
@@ -241,6 +244,8 @@ class MeasurementService:
         self._last_seen_remote_bssid: Optional[str] = None
         self._remote_ping_timeout_streak = 0
         self._remote_timeout_snapshot_taken = False
+        self._bssid_switch_enabled_ssid: Optional[str] = None
+        self._last_bssid_switch: Optional[Dict[str, str]] = None
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -364,14 +369,70 @@ class MeasurementService:
 
     def list_local_access_points(self) -> Dict[str, Any]:
         if IS_WINDOWS:
-            raise RuntimeError("BSSID switching is available on Jetson/Linux only")
+            raise RuntimeError("AP switching is available on Jetson/Linux only")
         with self._lock:
             config = self._config
+            enabled_ssid = self._bssid_switch_enabled_ssid
         use_sudo = config.use_sudo if config and config.measurement_mode == "local" else DEFAULT_USE_SUDO
         with self._network_switch_lock:
             current = get_current_local_wifi_state(use_sudo)
             access_points = scan_local_neighbors(use_sudo, None)
-        return {"current": current, "access_points": access_points}
+            try:
+                bssid_lock = get_local_wifi_bssid_lock(use_sudo)
+            except RuntimeError:
+                bssid_lock = {"connection": "", "bssid": ""}
+        return {
+            "current": current,
+            "access_points": access_points,
+            "bssid_switch_enabled_ssid": enabled_ssid,
+            "bssid_lock": bssid_lock,
+        }
+
+    def switch_local_ap(self, ssid: str) -> Dict[str, Any]:
+        if IS_WINDOWS:
+            raise RuntimeError("AP switching is available on Jetson/Linux only")
+        normalized_ssid = ssid.strip()
+        if not normalized_ssid:
+            raise RuntimeError("SSID is required")
+        with self._lock:
+            config = self._config
+        if config and config.measurement_mode != "local":
+            raise RuntimeError("AP switching is available in local measurement mode only")
+        use_sudo = config.use_sudo if config else DEFAULT_USE_SUDO
+
+        with self._network_switch_lock:
+            before = get_current_local_wifi_state(use_sudo)
+            started_at = dt.datetime.now().isoformat(timespec="seconds")
+            started_monotonic = time.monotonic()
+            try:
+                connected = switch_local_wifi_ssid(use_sudo, normalized_ssid)
+                self._refresh_local_ping_target(config)
+                with self._lock:
+                    self._bssid_switch_enabled_ssid = normalized_ssid
+                    self._last_bssid_switch = None
+                self._write_connection_event(
+                    started_at,
+                    "ap_switch",
+                    normalized_ssid,
+                    "",
+                    connected,
+                    round((time.monotonic() - started_monotonic) * 1000),
+                    "success",
+                    f"from_ssid={before.get('ssid', '')};from_bssid={before.get('bssid', '')}",
+                )
+                return {"ok": True, "before": before, "connected": connected}
+            except Exception as exc:  # noqa: BLE001
+                self._write_connection_event(
+                    started_at,
+                    "ap_switch",
+                    normalized_ssid,
+                    "",
+                    {},
+                    round((time.monotonic() - started_monotonic) * 1000),
+                    "failed",
+                    str(exc),
+                )
+                raise
 
     def switch_local_bssid(self, ssid: str, bssid: str) -> Dict[str, Any]:
         if IS_WINDOWS:
@@ -379,21 +440,29 @@ class MeasurementService:
         with self._lock:
             config = self._config
             running = self._thread is not None and self._thread.is_alive()
+            enabled_ssid = self._bssid_switch_enabled_ssid
         if not config or config.measurement_mode != "local" or not running:
             raise RuntimeError("Start local measurement before switching BSSID")
+        if enabled_ssid != ssid.strip():
+            raise RuntimeError("Switch the AP first, then select a BSSID for that same SSID")
 
         with self._network_switch_lock:
             before = get_current_local_wifi_state(config.use_sudo)
+            if str(before.get("ssid", "")).strip() != ssid.strip():
+                raise RuntimeError("Current SSID does not match the AP selected for BSSID switching")
             started_at = dt.datetime.now().isoformat(timespec="seconds")
             started_monotonic = time.monotonic()
             try:
                 connected = switch_local_wifi_bssid(config.use_sudo, ssid, bssid)
-                if config.auto_gateway:
-                    self._ping_target_info = resolve_ping_target(
-                        config.ping_target, config.auto_gateway, DEFAULT_PING_TARGET
-                    )
+                self._refresh_local_ping_target(config)
+                with self._lock:
+                    self._last_bssid_switch = {
+                        "ssid": str(connected.get("ssid", "")),
+                        "bssid": str(connected.get("bssid", "")).lower(),
+                    }
                 self._write_connection_event(
                     started_at,
+                    "bssid_switch",
                     ssid,
                     bssid,
                     connected,
@@ -410,6 +479,7 @@ class MeasurementService:
             except Exception as exc:  # noqa: BLE001
                 self._write_connection_event(
                     started_at,
+                    "bssid_switch",
                     ssid,
                     bssid,
                     {},
@@ -419,9 +489,99 @@ class MeasurementService:
                 )
                 raise
 
+    def fix_local_bssid(self) -> Dict[str, Any]:
+        if IS_WINDOWS:
+            raise RuntimeError("BSSID locking is available on Jetson/Linux only")
+        with self._lock:
+            config = self._config
+            last_switch = dict(self._last_bssid_switch) if self._last_bssid_switch else None
+        if not config or config.measurement_mode != "local" or not last_switch:
+            raise RuntimeError("Switch a BSSID during local measurement before fixing it")
+
+        with self._network_switch_lock:
+            current = get_current_local_wifi_state(config.use_sudo)
+            if (
+                str(current.get("ssid", "")) != last_switch["ssid"]
+                or str(current.get("bssid", "")).lower() != last_switch["bssid"]
+            ):
+                raise RuntimeError("The current connection is different from the last switched BSSID")
+            started_at = dt.datetime.now().isoformat(timespec="seconds")
+            started_monotonic = time.monotonic()
+            try:
+                lock_info = set_local_wifi_bssid_lock(config.use_sudo, last_switch["bssid"])
+                self._write_connection_event(
+                    started_at,
+                    "bssid_lock",
+                    last_switch["ssid"],
+                    last_switch["bssid"],
+                    current,
+                    round((time.monotonic() - started_monotonic) * 1000),
+                    "success",
+                    f"connection={lock_info.get('connection', '')}",
+                )
+                return {"ok": True, "connected": current, "bssid_lock": lock_info}
+            except Exception as exc:  # noqa: BLE001
+                self._write_connection_event(
+                    started_at,
+                    "bssid_lock",
+                    last_switch["ssid"],
+                    last_switch["bssid"],
+                    current,
+                    round((time.monotonic() - started_monotonic) * 1000),
+                    "failed",
+                    str(exc),
+                )
+                raise
+
+    def clear_local_bssid_fix(self) -> Dict[str, Any]:
+        if IS_WINDOWS:
+            raise RuntimeError("BSSID locking is available on Jetson/Linux only")
+        with self._lock:
+            config = self._config
+        if config and config.measurement_mode != "local":
+            raise RuntimeError("BSSID locking is available in local measurement mode only")
+        use_sudo = config.use_sudo if config else DEFAULT_USE_SUDO
+        with self._network_switch_lock:
+            current = get_current_local_wifi_state(use_sudo)
+            started_at = dt.datetime.now().isoformat(timespec="seconds")
+            started_monotonic = time.monotonic()
+            try:
+                lock_info = set_local_wifi_bssid_lock(use_sudo, None)
+                self._write_connection_event(
+                    started_at,
+                    "bssid_unlock",
+                    str(current.get("ssid", "")),
+                    str(current.get("bssid", "")),
+                    current,
+                    round((time.monotonic() - started_monotonic) * 1000),
+                    "success",
+                    f"connection={lock_info.get('connection', '')}",
+                )
+                return {"ok": True, "connected": current, "bssid_lock": lock_info}
+            except Exception as exc:  # noqa: BLE001
+                self._write_connection_event(
+                    started_at,
+                    "bssid_unlock",
+                    str(current.get("ssid", "")),
+                    str(current.get("bssid", "")),
+                    current,
+                    round((time.monotonic() - started_monotonic) * 1000),
+                    "failed",
+                    str(exc),
+                )
+                raise
+
+    def _refresh_local_ping_target(self, config: Optional[MeasurementConfig]) -> None:
+        if not config or not config.auto_gateway:
+            return
+        self._ping_target_info = resolve_ping_target(
+            config.ping_target, config.auto_gateway, DEFAULT_PING_TARGET
+        )
+
     def _write_connection_event(
         self,
         timestamp: str,
+        event: str,
         ssid: str,
         bssid: str,
         connected: Dict[str, Any],
@@ -435,7 +595,7 @@ class MeasurementService:
             csv.writer(event_file).writerow(
                 [
                     timestamp,
-                    "bssid_switch",
+                    event,
                     ssid,
                     bssid,
                     connected.get("ssid", ""),

@@ -52,11 +52,12 @@ SSHリモート測定では、必要に応じて次のタイミングで追加�
 - Jetson: `install_jetson.sh` を一度実行し、`start_jetson.sh` で起動
 - Jetson自動起動: `install_service_jetson.sh`
 
-## Jetson BSSID切替テスト
+## Jetson AP切替 / BSSIDテスト
 
-- Jetsonローカル測定中に、周辺AP一覧からSSID/BSSIDを指定して接続先を切替
+- 通常操作では、周辺AP一覧からSSIDだけを指定して接続先を切替
+- AP切替に成功したSSIDに限り、ローカル測定中だけ同一SSID内のBSSID切替を有効化
+- BSSID切替後は、現在の接続プロファイルへBSSIDを固定でき、固定解除も可能
 - 切替中は測定ループと `nmcli` 操作を排他し、ログの競合を防止
-- 切替後に接続BSSIDを検証し、Gatewayを再検出
-- 切替前後のSSID/BSSID・所要時間・結果を `*_events.csv` に記録
+- AP切替・BSSID切替・固定・固定解除の結果を `*_events.csv` に記録
 - ダッシュボードの確認チェックと確認ダイアログを通過した場合だけ実行
 - USBまたは有線LAN経由でダッシュボードへ接続中にのみ使用すること。Wi-Fi経由で実行するとブラウザとの通信が切断されます。

@@ -37,10 +37,15 @@ const exportButton = document.getElementById("export-btn");
 const exportAllButton = document.getElementById("export-all-btn");
 const remotePrepareBtn = document.getElementById("remote-prepare-btn");
 const bssidSwitchSection = document.getElementById("bssid-switch-section");
+const apSwitchSelect = document.getElementById("ap-switch-select");
 const bssidSwitchSelect = document.getElementById("bssid-switch-select");
 const refreshBssidBtn = document.getElementById("refresh-bssid-btn");
 const bssidSwitchConfirm = document.getElementById("bssid-switch-confirm");
+const switchApBtn = document.getElementById("switch-ap-btn");
 const switchBssidBtn = document.getElementById("switch-bssid-btn");
+const fixBssidBtn = document.getElementById("fix-bssid-btn");
+const clearBssidFixBtn = document.getElementById("clear-bssid-fix-btn");
+const apSwitchStatus = document.getElementById("ap-switch-status");
 const bssidSwitchStatus = document.getElementById("bssid-switch-status");
 const titleToggle = document.getElementById("title-toggle");
 const timezoneSelect = document.getElementById("timezone-select");
@@ -58,6 +63,9 @@ const importToleranceInput = document.getElementById("import-tolerance-ms");
 const state = {
   running: false,
   localBssidSwitchSupported: false,
+  currentWifi: {},
+  bssidSwitchEnabledSsid: "",
+  bssidLock: {},
   bands: {},
   ssidOptions: [],
   timezoneOptions: [],
@@ -178,7 +186,7 @@ function attachEvents() {
     remotePrepareBtn.addEventListener("click", handleRemotePrepare);
   }
   if (refreshBssidBtn) {
-    refreshBssidBtn.addEventListener("click", loadBssidCandidates);
+    refreshBssidBtn.addEventListener("click", loadAccessPointCandidates);
   }
   if (bssidSwitchConfirm) {
     bssidSwitchConfirm.addEventListener("change", syncBssidSwitchState);
@@ -186,8 +194,20 @@ function attachEvents() {
   if (bssidSwitchSelect) {
     bssidSwitchSelect.addEventListener("change", syncBssidSwitchState);
   }
+  if (apSwitchSelect) {
+    apSwitchSelect.addEventListener("change", syncBssidSwitchState);
+  }
+  if (switchApBtn) {
+    switchApBtn.addEventListener("click", handleApSwitch);
+  }
   if (switchBssidBtn) {
     switchBssidBtn.addEventListener("click", handleBssidSwitch);
+  }
+  if (fixBssidBtn) {
+    fixBssidBtn.addEventListener("click", handleBssidFix);
+  }
+  if (clearBssidFixBtn) {
+    clearBssidFixBtn.addEventListener("click", handleClearBssidFix);
   }
   if (undoPointBtn) {
     undoPointBtn.addEventListener("click", handleUndoLastPoint);
@@ -320,43 +340,108 @@ function syncBssidSwitchState() {
   const isLocal = measurementModeSelect?.value !== "remote_ssh";
   const isSupported = state.localBssidSwitchSupported;
   const isAvailable = isLocal && isSupported;
+  const currentSsid = state.currentWifi?.ssid || "";
+  const bssidTestEnabled = isAvailable && state.bssidSwitchEnabledSsid === currentSsid;
   const hasCandidate = Boolean(bssidSwitchSelect?.value);
+  const hasApCandidate = Boolean(apSwitchSelect?.value);
   const confirmed = Boolean(bssidSwitchConfirm?.checked);
   bssidSwitchSection?.classList.toggle("is-active", isAvailable);
   bssidSwitchSection?.classList.toggle("is-inactive", !isAvailable);
   if (refreshBssidBtn) refreshBssidBtn.disabled = !isAvailable;
-  if (bssidSwitchSelect) bssidSwitchSelect.disabled = !isAvailable;
-  if (switchBssidBtn) switchBssidBtn.disabled = !isAvailable || !state.running || !hasCandidate || !confirmed;
+  if (apSwitchSelect) apSwitchSelect.disabled = !isAvailable;
+  if (switchApBtn) switchApBtn.disabled = !isAvailable || !hasApCandidate || !confirmed;
+  if (bssidSwitchSelect) bssidSwitchSelect.disabled = !bssidTestEnabled;
+  if (switchBssidBtn) switchBssidBtn.disabled = !bssidTestEnabled || !state.running || !hasCandidate || !confirmed;
+  if (fixBssidBtn) fixBssidBtn.disabled = !bssidTestEnabled || !state.running || !confirmed;
+  if (clearBssidFixBtn) clearBssidFixBtn.disabled = !isAvailable || !state.bssidLock?.bssid || !confirmed;
   if (bssidSwitchStatus && !isLocal) {
     bssidSwitchStatus.textContent = "Jetsonローカル測定でのみ使用できます。";
   }
 }
 
-async function loadBssidCandidates() {
+function setSelectOptions(select, options, placeholder) {
+  if (!select) return;
+  const previousValue = select.value;
+  select.replaceChildren(new Option(placeholder, ""));
+  for (const option of options) {
+    select.add(option);
+  }
+  if ([...select.options].some((option) => option.value === previousValue)) {
+    select.value = previousValue;
+  }
+}
+
+async function loadAccessPointCandidates() {
   if (measurementModeSelect?.value === "remote_ssh" || !state.localBssidSwitchSupported) return;
   try {
     if (refreshBssidBtn) refreshBssidBtn.disabled = true;
-    if (bssidSwitchStatus) bssidSwitchStatus.textContent = "候補APを取得中...";
+    if (apSwitchStatus) apSwitchStatus.textContent = "候補APを取得中...";
     const response = await fetch("/api/local/access-points");
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || "候補APの取得に失敗しました");
-    if (bssidSwitchSelect) {
-      bssidSwitchSelect.replaceChildren();
-      const placeholder = new Option("接続先BSSIDを選択", "");
-      bssidSwitchSelect.add(placeholder);
-      for (const ap of data.access_points || []) {
-        const label = `${ap.ssid || "(hidden)"} | ${ap.bssid} | CH ${ap.channel || "-"} | ${ap.signal || "-"}%`;
-        const option = new Option(label, ap.bssid || "");
-        option.dataset.ssid = ap.ssid || "";
-        bssidSwitchSelect.add(option);
-      }
+    state.currentWifi = data.current || {};
+    state.bssidSwitchEnabledSsid = data.bssid_switch_enabled_ssid || "";
+    state.bssidLock = data.bssid_lock || {};
+    const accessPoints = data.access_points || [];
+    const ssids = [...new Set(accessPoints.map((ap) => ap.ssid).filter(Boolean))].sort();
+    setSelectOptions(
+      apSwitchSelect,
+      ssids.map((ssid) => new Option(ssid, ssid)),
+      "接続先SSIDを選択",
+    );
+    const currentSsid = state.currentWifi.ssid || "";
+    setSelectOptions(
+      bssidSwitchSelect,
+      accessPoints
+        .filter((ap) => ap.ssid === currentSsid)
+        .map((ap) => {
+          const label = `${ap.bssid} | CH ${ap.channel || "-"} | ${ap.signal || "-"}%`;
+          const option = new Option(label, ap.bssid || "");
+          option.dataset.ssid = ap.ssid || "";
+          return option;
+        }),
+      "同一SSID内のBSSIDを選択",
+    );
+    if (apSwitchStatus) {
+      apSwitchStatus.textContent = `現在: ${currentSsid || "-"} / ${state.currentWifi.bssid || "-"}`;
     }
-    const current = data.current || {};
     if (bssidSwitchStatus) {
-      bssidSwitchStatus.textContent = `現在: ${current.ssid || "-"} / ${current.bssid || "-"}`;
+      bssidSwitchStatus.textContent = state.bssidLock.bssid
+        ? `固定中: ${state.bssidLock.bssid} (${state.bssidLock.connection || "接続プロファイル"})`
+        : bssidTestEnabledMessage(currentSsid);
     }
   } catch (error) {
-    if (bssidSwitchStatus) bssidSwitchStatus.textContent = error.message;
+    if (apSwitchStatus) apSwitchStatus.textContent = error.message;
+  } finally {
+    syncBssidSwitchState();
+  }
+}
+
+function bssidTestEnabledMessage(currentSsid) {
+  return state.bssidSwitchEnabledSsid === currentSsid && currentSsid
+    ? `BSSIDテスト有効: ${currentSsid}`
+    : "APを切り替えると、同一SSID内のBSSIDテストを有効にできます。";
+}
+
+async function handleApSwitch() {
+  const ssid = apSwitchSelect?.value || "";
+  if (!ssid || !bssidSwitchConfirm?.checked) return;
+  if (!window.confirm(`Jetsonの接続先を ${ssid} へ切り替えます。USBまたは有線LANで接続中であることを確認してください。`)) return;
+  try {
+    if (switchApBtn) switchApBtn.disabled = true;
+    if (apSwitchStatus) apSwitchStatus.textContent = "APを切り替え中...";
+    const response = await fetch("/api/local/switch-ap", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ssid, acknowledged_usb_or_lan: true }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "AP切替に失敗しました");
+    if (form.ssid && data.connected?.ssid) form.ssid.value = data.connected.ssid;
+    if (apSwitchStatus) apSwitchStatus.textContent = `AP切替完了: ${data.connected?.ssid || ssid}`;
+    await loadAccessPointCandidates();
+  } catch (error) {
+    if (apSwitchStatus) apSwitchStatus.textContent = error.message;
   } finally {
     syncBssidSwitchState();
   }
@@ -380,7 +465,51 @@ async function handleBssidSwitch() {
     if (!response.ok) throw new Error(data.detail || "BSSID切替に失敗しました");
     if (form.ssid && data.connected?.ssid) form.ssid.value = data.connected.ssid;
     if (bssidSwitchStatus) bssidSwitchStatus.textContent = `切替完了: ${data.connected?.ssid || ssid} / ${data.connected?.bssid || bssid}`;
-    await loadBssidCandidates();
+    await loadAccessPointCandidates();
+  } catch (error) {
+    if (bssidSwitchStatus) bssidSwitchStatus.textContent = error.message;
+  } finally {
+    syncBssidSwitchState();
+  }
+}
+
+async function handleBssidFix() {
+  if (!bssidSwitchConfirm?.checked) return;
+  if (!window.confirm("現在接続中のBSSIDを接続プロファイルへ固定します。")) return;
+  try {
+    if (fixBssidBtn) fixBssidBtn.disabled = true;
+    if (bssidSwitchStatus) bssidSwitchStatus.textContent = "BSSIDを固定中...";
+    const response = await fetch("/api/local/fix-bssid", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ acknowledged_usb_or_lan: true }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "BSSID固定に失敗しました");
+    state.bssidLock = data.bssid_lock || {};
+    if (bssidSwitchStatus) bssidSwitchStatus.textContent = `固定しました: ${state.bssidLock.bssid || "-"}`;
+  } catch (error) {
+    if (bssidSwitchStatus) bssidSwitchStatus.textContent = error.message;
+  } finally {
+    syncBssidSwitchState();
+  }
+}
+
+async function handleClearBssidFix() {
+  if (!bssidSwitchConfirm?.checked) return;
+  if (!window.confirm("接続プロファイルのBSSID固定を解除します。")) return;
+  try {
+    if (clearBssidFixBtn) clearBssidFixBtn.disabled = true;
+    if (bssidSwitchStatus) bssidSwitchStatus.textContent = "BSSID固定を解除中...";
+    const response = await fetch("/api/local/clear-bssid-fix", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ acknowledged_usb_or_lan: true }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "BSSID固定の解除に失敗しました");
+    state.bssidLock = data.bssid_lock || {};
+    if (bssidSwitchStatus) bssidSwitchStatus.textContent = "BSSID固定を解除しました。";
   } catch (error) {
     if (bssidSwitchStatus) bssidSwitchStatus.textContent = error.message;
   } finally {

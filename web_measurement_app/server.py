@@ -67,6 +67,15 @@ class BssidSwitchRequest(BaseModel):
     acknowledged_usb_or_lan: bool = False
 
 
+class ApSwitchRequest(BaseModel):
+    ssid: str
+    acknowledged_usb_or_lan: bool = False
+
+
+class BssidLockRequest(BaseModel):
+    acknowledged_usb_or_lan: bool = False
+
+
 def _resolve_source_csv_path(source_csv: str | None) -> Path:
     if source_csv:
         path = Path(source_csv).expanduser()
@@ -240,6 +249,36 @@ async def switch_local_bssid(payload: BssidSwitchRequest):
         raise HTTPException(status_code=400, detail="Confirm that the dashboard is connected through USB or wired LAN")
     try:
         return service.switch_local_bssid(payload.ssid, payload.bssid)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/local/switch-ap")
+async def switch_local_ap(payload: ApSwitchRequest):
+    if not payload.acknowledged_usb_or_lan:
+        raise HTTPException(status_code=400, detail="Confirm that the dashboard is connected through USB or wired LAN")
+    try:
+        return service.switch_local_ap(payload.ssid)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/local/fix-bssid")
+async def fix_local_bssid(payload: BssidLockRequest):
+    if not payload.acknowledged_usb_or_lan:
+        raise HTTPException(status_code=400, detail="Confirm that the dashboard is connected through USB or wired LAN")
+    try:
+        return service.fix_local_bssid()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/local/clear-bssid-fix")
+async def clear_local_bssid_fix(payload: BssidLockRequest):
+    if not payload.acknowledged_usb_or_lan:
+        raise HTTPException(status_code=400, detail="Confirm that the dashboard is connected through USB or wired LAN")
+    try:
+        return service.clear_local_bssid_fix()
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
