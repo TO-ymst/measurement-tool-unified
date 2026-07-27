@@ -27,6 +27,7 @@ from .logger_core import (
     DEFAULT_TIMEZONE,
     DEFAULT_USE_SUDO,
     DEFAULT_WIFI_DISCONNECTED_VALUE,
+    IS_WINDOWS,
     ensure_remote_ssh_key,
     get_current_ssid,
     list_available_ssids,
@@ -163,6 +164,7 @@ async def read_defaults() -> Dict[str, Any]:
         "remote_advanced_snapshot_on_ping_timeout": False,
         "remote_advanced_ping_timeout_streak": 1,
         "remote_advanced_max_output_chars": 12000,
+        "local_bssid_switch_supported": not IS_WINDOWS,
     }
 
 

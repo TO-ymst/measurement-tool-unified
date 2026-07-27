@@ -57,6 +57,7 @@ const importToleranceInput = document.getElementById("import-tolerance-ms");
 
 const state = {
   running: false,
+  localBssidSwitchSupported: false,
   bands: {},
   ssidOptions: [],
   timezoneOptions: [],
@@ -104,6 +105,7 @@ async function loadDefaults() {
   try {
     const resp = await fetch("/api/defaults");
     const data = await resp.json();
+    state.localBssidSwitchSupported = Boolean(data.local_bssid_switch_supported);
     state.bands = data.bands || {};
     state.ssidOptions = data.ssid_options || [];
     state.timezoneOptions = data.timezone_options || [];
@@ -316,18 +318,22 @@ function syncMeasurementModeState() {
 
 function syncBssidSwitchState() {
   const isLocal = measurementModeSelect?.value !== "remote_ssh";
+  const isSupported = state.localBssidSwitchSupported;
+  const isAvailable = isLocal && isSupported;
   const hasCandidate = Boolean(bssidSwitchSelect?.value);
   const confirmed = Boolean(bssidSwitchConfirm?.checked);
-  if (refreshBssidBtn) refreshBssidBtn.disabled = !isLocal;
-  if (bssidSwitchSelect) bssidSwitchSelect.disabled = !isLocal;
-  if (switchBssidBtn) switchBssidBtn.disabled = !isLocal || !state.running || !hasCandidate || !confirmed;
+  bssidSwitchSection?.classList.toggle("is-active", isAvailable);
+  bssidSwitchSection?.classList.toggle("is-inactive", !isAvailable);
+  if (refreshBssidBtn) refreshBssidBtn.disabled = !isAvailable;
+  if (bssidSwitchSelect) bssidSwitchSelect.disabled = !isAvailable;
+  if (switchBssidBtn) switchBssidBtn.disabled = !isAvailable || !state.running || !hasCandidate || !confirmed;
   if (bssidSwitchStatus && !isLocal) {
     bssidSwitchStatus.textContent = "Jetsonローカル測定でのみ使用できます。";
   }
 }
 
 async function loadBssidCandidates() {
-  if (measurementModeSelect?.value === "remote_ssh") return;
+  if (measurementModeSelect?.value === "remote_ssh" || !state.localBssidSwitchSupported) return;
   try {
     if (refreshBssidBtn) refreshBssidBtn.disabled = true;
     if (bssidSwitchStatus) bssidSwitchStatus.textContent = "候補APを取得中...";
