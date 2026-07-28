@@ -129,6 +129,7 @@ async function loadDefaults() {
     form.ping_fail_value.value = data.ping_fail_value;
     form.ping_timeout_ms.value = data.ping_timeout_ms;
     form.wifi_disconnected_value.value = data.wifi_disconnected_value;
+    if (form.wifi_reconnect_cooldown_sec) form.wifi_reconnect_cooldown_sec.value = data.wifi_reconnect_cooldown_sec ?? 15;
     form.log_base.value = data.log_base;
     form.timezone.value = data.timezone;
     if (form.remote_host) form.remote_host.value = data.remote_host || "";
@@ -139,6 +140,7 @@ async function loadDefaults() {
     if (form.remote_neighbor_ssid) form.remote_neighbor_ssid.value = data.remote_neighbor_ssid || "";
     if (form.remote_ssh_key_comment) form.remote_ssh_key_comment.value = data.remote_ssh_key_comment || "";
     form.auto_gateway.checked = data.auto_gateway;
+    if (form.auto_reconnect_wifi) form.auto_reconnect_wifi.checked = !!data.auto_reconnect_wifi;
     if (form.remote_enable_neighbor_scan) form.remote_enable_neighbor_scan.checked = !!data.remote_enable_neighbor_scan;
     if (form.remote_setup_ssh_key) form.remote_setup_ssh_key.checked = !!data.remote_setup_ssh_key;
     if (form.remote_cleanup_ssh_key) form.remote_cleanup_ssh_key.checked = !!data.remote_cleanup_ssh_key;
@@ -722,6 +724,7 @@ function buildPayload() {
     "timeout_as_numeric",
     "use_sudo",
     "sync_time",
+    "auto_reconnect_wifi",
     "remote_enable_neighbor_scan",
     "remote_setup_ssh_key",
     "remote_cleanup_ssh_key",
@@ -740,6 +743,7 @@ function buildPayload() {
     "ping_fail_value",
     "ping_timeout_ms",
     "wifi_disconnected_value",
+    "wifi_reconnect_cooldown_sec",
     "channel_min",
     "channel_max",
     "retain_rows",
@@ -769,6 +773,7 @@ function buildPayload() {
   payload.retain_rows = Number(fd.get("retain_rows")) || 20000;
   payload.remote_advanced_ping_timeout_streak = Number(fd.get("remote_advanced_ping_timeout_streak")) || 1;
   payload.remote_advanced_max_output_chars = Number(fd.get("remote_advanced_max_output_chars")) || 12000;
+  payload.wifi_reconnect_cooldown_sec = Number(fd.get("wifi_reconnect_cooldown_sec")) || 15;
   return payload;
 }
 

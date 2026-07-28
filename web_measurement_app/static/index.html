@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Wi-Fi Measurement Dashboard</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260305_1" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260728_reconnect" />
   </head>
   <body>
     <header>
@@ -157,6 +157,9 @@
               <label>スキャン間隔 (秒)
                 <input type="number" step="0.1" min="0.1" name="interval" />
               </label>
+              <label>Wi-Fi再接続試行間隔 (秒)
+                <input type="number" min="5" max="3600" name="wifi_reconnect_cooldown_sec" />
+              </label>
               <label>Wi-Fi未接続時代替値
                 <input type="number" name="wifi_disconnected_value" />
               </label>
@@ -172,6 +175,9 @@
               <label>保持行数
                 <input type="number" name="retain_rows" min="1000" max="200000" value="20000" />
               </label>
+            </div>
+            <div class="form-flags">
+              <label><input type="checkbox" name="auto_reconnect_wifi" checked /> Wi-Fi切断時に保存済みAPへ再接続</label>
             </div>
           </section>
           <section class="config-section local-config-section flow-local-config" id="local-config-section">
@@ -352,6 +358,6 @@
       </section>
     </main>
 
-    <script defer src="/static/app.js?v=20260305_1"></script>
+    <script defer src="/static/app.js?v=20260728_reconnect"></script>
   </body>
 </html>

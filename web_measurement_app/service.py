@@ -34,6 +34,7 @@ from .logger_core import (
     DEFAULT_TIMEZONE,
     DEFAULT_USE_GATEWAY,
     DEFAULT_USE_SUDO,
+    DEFAULT_WIFI_RECONNECT_COOLDOWN_SEC,
     DEFAULT_WIFI_DISCONNECTED_VALUE,
     HEADERS,
     NEIGHBOR_HEADERS,
@@ -52,6 +53,8 @@ from .logger_core import (
     prepare_log_file,
     prepare_sidecar_file,
     probe_remote_ssh,
+    reconnect_local_wifi,
+    reconnect_remote_wifi,
     remove_remote_ssh_key,
     resolve_ping_target,
     scan_local_neighbors,
@@ -76,6 +79,8 @@ class MeasurementConfig(BaseModel):
     ping_timeout_ms: int = Field(default=DEFAULT_PING_TIMEOUT_MS, ge=1, le=60000)
     timeout_as_numeric: bool = Field(default=True)
     wifi_disconnected_value: float = Field(default=DEFAULT_WIFI_DISCONNECTED_VALUE)
+    auto_reconnect_wifi: bool = Field(default=True)
+    wifi_reconnect_cooldown_sec: int = Field(default=DEFAULT_WIFI_RECONNECT_COOLDOWN_SEC, ge=5, le=3600)
     prefix: Optional[str] = None
     log_base: str = Field(default=DEFAULT_LOG_BASE)
     output_dir: str = Field(default=".")
@@ -248,6 +253,7 @@ class MeasurementService:
         self._remote_timeout_snapshot_taken = False
         self._bssid_switch_enabled_ssid: Optional[str] = None
         self._last_bssid_switch: Optional[Dict[str, str]] = None
+        self._last_wifi_reconnect_attempt = 0.0
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -277,6 +283,7 @@ class MeasurementService:
             self._last_seen_remote_bssid = None
             self._remote_ping_timeout_streak = 0
             self._remote_timeout_snapshot_taken = False
+            self._last_wifi_reconnect_attempt = 0.0
             with self._connection_event_path.open("w", newline="", encoding="utf-8-sig") as event_file:
                 csv.writer(event_file).writerow(CONNECTION_EVENT_HEADERS)
 
@@ -689,6 +696,65 @@ class MeasurementService:
                 ]
             )
 
+    def _can_attempt_wifi_reconnect(self, config: MeasurementConfig) -> bool:
+        if not config.auto_reconnect_wifi or not config.ssid:
+            return False
+        now = time.monotonic()
+        if now - self._last_wifi_reconnect_attempt < config.wifi_reconnect_cooldown_sec:
+            return False
+        self._last_wifi_reconnect_attempt = now
+        return True
+
+    def _ensure_local_wifi_connected(self, config: MeasurementConfig) -> Dict[str, Any]:
+        try:
+            current = get_current_local_wifi_state(config.use_sudo)
+        except RuntimeError:
+            current = {}
+        if str(current.get("ssid", "")) == config.ssid or not self._can_attempt_wifi_reconnect(config):
+            return current
+
+        started = time.monotonic()
+        timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
+        try:
+            connected = reconnect_local_wifi(config.use_sudo, config.ssid)
+            self._refresh_local_ping_target(config)
+            self._write_connection_event(
+                timestamp, "wifi_reconnect", config.ssid, "", connected,
+                round((time.monotonic() - started) * 1000), "success", "saved_profile",
+            )
+            return connected
+        except Exception as exc:  # noqa: BLE001
+            self._write_connection_event(
+                timestamp, "wifi_reconnect", config.ssid, "", current,
+                round((time.monotonic() - started) * 1000), "failed", str(exc),
+            )
+            return current
+
+    def _ensure_remote_wifi_connected(
+        self, config: MeasurementConfig, current: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if str(current.get("ssid", "")) == config.ssid or not self._can_attempt_wifi_reconnect(config):
+            return current
+
+        started = time.monotonic()
+        timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
+        try:
+            connected = reconnect_remote_wifi(
+                host=config.remote_host or "", user=config.remote_user, port=config.remote_port,
+                identity_file=config.remote_identity_file, ssid=config.ssid,
+            )
+            self._write_connection_event(
+                timestamp, "remote_wifi_reconnect", config.ssid, "", connected,
+                round((time.monotonic() - started) * 1000), "success", "saved_profile",
+            )
+            return connected
+        except Exception as exc:  # noqa: BLE001
+            self._write_connection_event(
+                timestamp, "remote_wifi_reconnect", config.ssid, "", current,
+                round((time.monotonic() - started) * 1000), "failed", str(exc),
+            )
+            return current
+
     def register_listener(self) -> asyncio.Queue:
         if not self._loop:
             raise RuntimeError("Event loop not bound")
@@ -766,6 +832,19 @@ class MeasurementService:
                 sample_index=sample_no,
                 neighbor_ssid=config.remote_neighbor_ssid,
             )
+            if str(remote_row.get("ssid", "")) != config.ssid:
+                reconnected = self._ensure_remote_wifi_connected(config, remote_row)
+                if str(reconnected.get("ssid", "")) == config.ssid:
+                    remote_row = fetch_remote_wifi_state(
+                        host=config.remote_host or "",
+                        user=config.remote_user,
+                        port=config.remote_port,
+                        identity_file=config.remote_identity_file,
+                        ping_target=config.ping_target,
+                        neighbor_every=config.remote_neighbor_every if config.remote_enable_neighbor_scan else 0,
+                        sample_index=sample_no,
+                        neighbor_ssid=config.remote_neighbor_ssid,
+                    )
             error_message = ""
             wifi_rows = [remote_row]
         except Exception as exc:  # noqa: BLE001
@@ -886,6 +965,7 @@ class MeasurementService:
         target_ip: str,
         sample_no: int,
     ) -> None:
+        self._ensure_local_wifi_connected(config)
         try:
             wifi_rows = fetch_wifi_rows(
                 config.use_sudo,

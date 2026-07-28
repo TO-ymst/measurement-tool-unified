@@ -98,6 +98,7 @@ DEFAULT_INTERVAL = 1.0
 DEFAULT_PING_FAIL_VALUE = 999.0
 DEFAULT_PING_TIMEOUT_MS = 2000
 DEFAULT_WIFI_DISCONNECTED_VALUE = 999.0
+DEFAULT_WIFI_RECONNECT_COOLDOWN_SEC = 15
 DEFAULT_USE_SUDO = not IS_WINDOWS
 DEFAULT_REMOTE_USER = "nvidia"
 DEFAULT_REMOTE_PORT = 22
@@ -757,6 +758,22 @@ def switch_local_wifi_ssid(use_sudo: bool, ssid: str, password: Optional[str] = 
     return connected
 
 
+def reconnect_local_wifi(use_sudo: bool, ssid: str) -> Dict[str, object]:
+    if IS_WINDOWS:
+        raise RuntimeError("Wi-Fi reconnect is supported on Jetson/Linux only")
+    normalized_ssid = ssid.strip()
+    if not normalized_ssid:
+        raise RuntimeError("SSID is required")
+    try:
+        _run_local_nmcli(use_sudo, ["--wait", "30", "connection", "up", "id", normalized_ssid])
+    except RuntimeError:
+        return switch_local_wifi_ssid(use_sudo, normalized_ssid)
+    connected = get_current_local_wifi_state(use_sudo)
+    if connected.get("ssid") != normalized_ssid:
+        raise RuntimeError(f"Wi-Fi reconnect verification failed: {connected.get('ssid') or 'not connected'}")
+    return connected
+
+
 def switch_local_wifi_bssid(use_sudo: bool, ssid: str, bssid: str) -> Dict[str, object]:
     if IS_WINDOWS:
         raise RuntimeError("BSSID switching is supported on Jetson/Linux only")
@@ -1090,6 +1107,53 @@ def probe_remote_ssh(
         timeout=10,
     )
     return (result.stdout or "").strip()
+
+
+def reconnect_remote_wifi(
+    host: str,
+    user: str,
+    port: int,
+    identity_file: Optional[str],
+    ssid: str,
+) -> Dict[str, object]:
+    profile_command = shlex.join(["nmcli", "--wait", "30", "connection", "up", "id", ssid])
+    fallback_command = shlex.join(["nmcli", "--wait", "30", "device", "wifi", "connect", ssid])
+    command = f"{profile_command} || {fallback_command}"
+    ssh_cmd = ["ssh", *_base_remote(port, identity_file), _build_target(user, host), command]
+    try:
+        result = subprocess.run(
+            ssh_cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=40,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Remote Wi-Fi reconnect timed out") from exc
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "Remote Wi-Fi reconnect failed").strip())
+
+    verify_cmd = [
+        "ssh",
+        *_base_remote(port, identity_file),
+        _build_target(user, host),
+        _build_wifi_probe_script(None),
+    ]
+    verify = subprocess.run(
+        verify_cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=10,
+    )
+    connected = _parse_wifi_line(_parse_key_values(verify.stdout).get("WIFI", ""))
+    if connected.get("ssid") != ssid:
+        raise RuntimeError(f"Remote Wi-Fi reconnect verification failed: {connected.get('ssid') or 'not connected'}")
+    return connected
 
 
 def fetch_remote_wifi_state(
