@@ -522,6 +522,24 @@ button:hover:not(:disabled) {
   margin-top: 0.8rem;
 }
 
+.wifi-current-status,
+.wifi-operation-status {
+  display: block;
+  font-weight: 700;
+}
+
+.wifi-current-status {
+  color: #dce7f5;
+}
+
+.wifi-status-success {
+  color: #55d99a;
+}
+
+.wifi-status-error {
+  color: #ff806f;
+}
+
 #live-log {
   font-family: "JetBrains Mono", "SFMono-Regular", Menlo, monospace;
   font-size: 0.8rem;

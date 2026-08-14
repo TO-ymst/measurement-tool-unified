@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Wi-Fi Measurement Dashboard</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260728_reconnect" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260812_norescan" />
   </head>
   <body>
     <header>
@@ -36,12 +36,12 @@
 
           <section class="config-section flow-ap-switch" id="bssid-switch-section">
             <div class="config-section-header">
-              <h3>Jetson AP切替 / BSSIDテスト</h3>
-              <p>通常はSSIDだけを切り替えます。BSSID操作はAP切替後の同一SSID内テスト用です。</p>
+              <h3>Jetson Wi-Fi接続 / SSID・BSSID固定</h3>
+              <p>接続先SSIDの変更、他SSIDへの自動接続禁止、同一SSID内のBSSID固定を行います。</p>
             </div>
             <p class="hint">USBまたは有線LANでJetsonへ接続中にのみ実行してください。Wi-Fi接続中に切り替えるとダッシュボードとの通信が切断されます。</p>
             <div class="form-grid">
-              <label>接続先AP (SSID)
+              <label>接続先SSID
                 <select id="ap-switch-select" disabled></select>
               </label>
               <label>Wi-Fiパスワード
@@ -52,19 +52,21 @@
               </label>
             </div>
             <div class="actions">
-              <button type="button" id="refresh-bssid-btn">候補APを更新</button>
-              <button type="button" id="switch-ap-btn" disabled>選択したAPへ切替</button>
-              <button type="button" id="fix-ap-btn" disabled>現在のAPを固定</button>
-              <button type="button" id="clear-ap-fix-btn" disabled>AP固定を解除</button>
+              <button type="button" id="refresh-bssid-btn">SSID/BSSID候補を再スキャン</button>
+              <button type="button" id="switch-ap-btn" disabled>選択したSSIDへ接続</button>
+              <button type="button" id="fix-ap-btn" disabled>選択したSSIDへ接続・固定</button>
+              <button type="button" id="clear-ap-fix-btn" disabled>SSID固定を解除・復元</button>
             </div>
-            <small class="hint" id="ap-switch-status">APを切り替えると、同一SSID内のBSSIDテストを有効にできます。</small>
+            <small class="hint">上段のSSID操作ではBSSIDを指定・固定しません。BSSID固定は下段の操作で行います。</small>
+            <small class="hint wifi-current-status" id="current-wifi-status">現在接続中: 取得中...</small>
+            <small class="hint wifi-operation-status" id="ap-switch-status" role="status" aria-live="polite">SSIDへ接続すると、同一SSID内のBSSIDを指定できます。</small>
             <div class="wifi-switch-divider"></div>
             <div class="actions">
-              <button type="button" id="switch-bssid-btn" disabled>選択したBSSIDへ切替</button>
+              <button type="button" id="switch-bssid-btn" disabled>選択したBSSIDへ切替・固定</button>
               <button type="button" id="fix-bssid-btn" disabled>現在のBSSIDを固定</button>
               <button type="button" id="clear-bssid-fix-btn" disabled>BSSID固定を解除</button>
             </div>
-            <small class="hint" id="bssid-switch-status">BSSID切替は、AP切替後かつローカル測定中にだけ実行できます。</small>
+            <small class="hint wifi-operation-status" id="bssid-switch-status" role="status" aria-live="polite">測定前にBSSIDへ切り替え、現在のBSSIDとして確認後に固定してください。</small>
           </section>
 
           <section class="config-section remote-config-section flow-remote-config" id="remote-config-section">
@@ -177,7 +179,8 @@
               </label>
             </div>
             <div class="form-flags">
-              <label><input type="checkbox" name="auto_reconnect_wifi" checked /> Wi-Fi切断時に保存済みAPへ再接続</label>
+              <label><input type="checkbox" name="auto_reconnect_wifi" checked /> Wi-Fi切断時に保存済みSSIDへ再接続</label>
+              <label><input type="checkbox" name="exclusive_ssid_during_measurement" checked /> 測定中は対象SSID以外へ自動接続しない</label>
             </div>
           </section>
           <section class="config-section local-config-section flow-local-config" id="local-config-section">
@@ -206,7 +209,7 @@
               </label>
             </div>
             <div class="form-flags">
-              <label><input type="checkbox" name="remote_enable_neighbor_scan" checked /> ネイバースキャンを取得</label>
+              <label><input type="checkbox" name="remote_enable_neighbor_scan" /> ネイバースキャンを取得</label>
             </div>
           </section>
           <label class="flow-ping-target">Pingターゲット
@@ -296,7 +299,7 @@
             <p>プロット形状</p>
             <select id="plot-shape-select">
               <option value="dot">丸点</option>
-              <option value="strip">短冊</option>
+              <option value="strip" selected>柵（短冊）</option>
             </select>
           </div>
           <div class="control-block">
@@ -358,6 +361,6 @@
       </section>
     </main>
 
-    <script defer src="/static/app.js?v=20260728_reconnect"></script>
+    <script defer src="/static/app.js?v=20260812_norescan"></script>
   </body>
 </html>

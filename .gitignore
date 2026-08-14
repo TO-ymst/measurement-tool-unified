@@ -1,9 +1,11 @@
 .venv/
+logs/
 __pycache__/
 *.pyc
 *.pyo
 *.csv
 *.jsonl
+*.png
 *.log
 *.tmp
 *.bak

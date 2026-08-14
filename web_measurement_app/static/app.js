@@ -48,6 +48,7 @@ const switchBssidBtn = document.getElementById("switch-bssid-btn");
 const fixBssidBtn = document.getElementById("fix-bssid-btn");
 const clearBssidFixBtn = document.getElementById("clear-bssid-fix-btn");
 const apSwitchStatus = document.getElementById("ap-switch-status");
+const currentWifiStatus = document.getElementById("current-wifi-status");
 const bssidSwitchStatus = document.getElementById("bssid-switch-status");
 const titleToggle = document.getElementById("title-toggle");
 const timezoneSelect = document.getElementById("timezone-select");
@@ -69,6 +70,8 @@ const state = {
   bssidSwitchEnabledSsid: "",
   bssidLock: {},
   apLock: {},
+  accessPoints: [],
+  savedWifiProfiles: [],
   bands: {},
   ssidOptions: [],
   timezoneOptions: [],
@@ -79,6 +82,8 @@ const state = {
   logsByPoint: new Map(),
   points: [],
   segments: [],
+  pointAdvancePending: false,
+  renderFrame: null,
   currentLogFile: "",
   currentMode: "ping",
   image: null,
@@ -95,7 +100,7 @@ const state = {
     labelSize: Number(labelSizeNumber?.value) || 14,
     anchorRadius: Number(anchorRadiusNumber?.value) || 5,
     plotRadius: Number(plotRadiusNumber?.value) || 3,
-    plotShape: plotShapeSelect?.value || "dot",
+    plotShape: plotShapeSelect?.value || "strip",
     labelColor: labelColorInput?.value || "#ff5de4",
     grayscaleEnabled: false,
     grayscaleLevel: Number(grayscaleRange?.value) || 100,
@@ -129,8 +134,9 @@ async function loadDefaults() {
     form.ping_fail_value.value = data.ping_fail_value;
     form.ping_timeout_ms.value = data.ping_timeout_ms;
     form.wifi_disconnected_value.value = data.wifi_disconnected_value;
-    if (form.wifi_reconnect_cooldown_sec) form.wifi_reconnect_cooldown_sec.value = data.wifi_reconnect_cooldown_sec ?? 15;
+    if (form.wifi_reconnect_cooldown_sec) form.wifi_reconnect_cooldown_sec.value = data.wifi_reconnect_cooldown_sec ?? 5;
     form.log_base.value = data.log_base;
+    if (form.output_dir) form.output_dir.value = data.output_dir || ".";
     form.timezone.value = data.timezone;
     if (form.remote_host) form.remote_host.value = data.remote_host || "";
     if (form.remote_user) form.remote_user.value = data.remote_user || "";
@@ -141,6 +147,9 @@ async function loadDefaults() {
     if (form.remote_ssh_key_comment) form.remote_ssh_key_comment.value = data.remote_ssh_key_comment || "";
     form.auto_gateway.checked = data.auto_gateway;
     if (form.auto_reconnect_wifi) form.auto_reconnect_wifi.checked = !!data.auto_reconnect_wifi;
+    if (form.exclusive_ssid_during_measurement) {
+      form.exclusive_ssid_during_measurement.checked = data.exclusive_ssid_during_measurement !== false;
+    }
     if (form.remote_enable_neighbor_scan) form.remote_enable_neighbor_scan.checked = !!data.remote_enable_neighbor_scan;
     if (form.remote_setup_ssh_key) form.remote_setup_ssh_key.checked = !!data.remote_setup_ssh_key;
     if (form.remote_cleanup_ssh_key) form.remote_cleanup_ssh_key.checked = !!data.remote_cleanup_ssh_key;
@@ -197,7 +206,10 @@ function attachEvents() {
     bssidSwitchSelect.addEventListener("change", syncBssidSwitchState);
   }
   if (apSwitchSelect) {
-    apSwitchSelect.addEventListener("change", syncBssidSwitchState);
+    apSwitchSelect.addEventListener("change", () => {
+      renderBssidCandidates();
+      syncBssidSwitchState();
+    });
   }
   if (switchApBtn) {
     switchApBtn.addEventListener("click", handleApSwitch);
@@ -349,8 +361,13 @@ function syncBssidSwitchState() {
   const isSupported = state.localBssidSwitchSupported;
   const isAvailable = isLocal && isSupported;
   const currentSsid = state.currentWifi?.ssid || "";
-  const bssidTestEnabled = isAvailable && state.bssidSwitchEnabledSsid === currentSsid;
+  const bssidTestEnabled = isAvailable && Boolean(currentSsid);
+  const selectedApSsid = apSwitchSelect?.value || "";
+  const bssidSelectionEnabled = isAvailable && Boolean(selectedApSsid);
   const hasCandidate = Boolean(bssidSwitchSelect?.value);
+  const selectedBssid = (bssidSwitchSelect?.value || "").toLowerCase();
+  const currentBssid = (state.currentWifi?.bssid || "").toLowerCase();
+  const selectedBssidIsCurrent = Boolean(selectedBssid && selectedBssid === currentBssid);
   const hasApCandidate = Boolean(apSwitchSelect?.value);
   bssidSwitchSection?.classList.toggle("is-active", isAvailable);
   bssidSwitchSection?.classList.toggle("is-inactive", !isAvailable);
@@ -358,11 +375,13 @@ function syncBssidSwitchState() {
   if (apSwitchSelect) apSwitchSelect.disabled = !isAvailable;
   if (apSwitchPassword) apSwitchPassword.disabled = !isAvailable;
   if (switchApBtn) switchApBtn.disabled = !isAvailable || !hasApCandidate;
-  if (fixApBtn) fixApBtn.disabled = !bssidTestEnabled;
+  const selectedSsidAlreadyLocked =
+    state.apLock?.locked === "yes" && state.apLock?.ssid === apSwitchSelect?.value;
+  if (fixApBtn) fixApBtn.disabled = !isAvailable || !hasApCandidate || selectedSsidAlreadyLocked;
   if (clearApFixBtn) clearApFixBtn.disabled = !isAvailable || state.apLock?.locked !== "yes";
-  if (bssidSwitchSelect) bssidSwitchSelect.disabled = !bssidTestEnabled;
-  if (switchBssidBtn) switchBssidBtn.disabled = !bssidTestEnabled || !state.running || !hasCandidate;
-  if (fixBssidBtn) fixBssidBtn.disabled = !bssidTestEnabled || !state.running;
+  if (bssidSwitchSelect) bssidSwitchSelect.disabled = !bssidSelectionEnabled;
+  if (switchBssidBtn) switchBssidBtn.disabled = !bssidSelectionEnabled || !hasCandidate;
+  if (fixBssidBtn) fixBssidBtn.disabled = !bssidTestEnabled || !selectedBssidIsCurrent;
   if (clearBssidFixBtn) clearBssidFixBtn.disabled = !isAvailable || !state.bssidLock?.bssid;
   if (bssidSwitchStatus && !isLocal) {
     bssidSwitchStatus.textContent = "Jetsonローカル測定でのみ使用できます。";
@@ -381,59 +400,92 @@ function setSelectOptions(select, options, placeholder) {
   }
 }
 
+function currentWifiSummary() {
+  const ssid = state.currentWifi?.ssid || "";
+  return ssid ? `${ssid} / ${state.currentWifi?.bssid || "-"}` : "Wi-Fi未接続";
+}
+
+function setWifiOperationStatus(element, message, result = "info") {
+  if (!element) return;
+  element.textContent = message;
+  element.classList.toggle("wifi-status-success", result === "success");
+  element.classList.toggle("wifi-status-error", result === "error");
+}
+
+function renderBssidCandidates() {
+  const selectedSsid = apSwitchSelect?.value || "";
+  const visibleCandidates = state.accessPoints.filter((ap) => ap.ssid === selectedSsid);
+  const visibleBssids = new Set(
+    visibleCandidates.map((ap) => (ap.bssid || "").toLowerCase()).filter(Boolean),
+  );
+  const options = visibleCandidates.map((ap) => {
+    const label = `${ap.bssid} | CH ${ap.channel || "-"} | ${ap.signal || "-"}%`;
+    const option = new Option(label, ap.bssid || "");
+    option.dataset.ssid = ap.ssid || "";
+    return option;
+  });
+  for (const profile of state.savedWifiProfiles) {
+    const bssid = (profile.bssid || "").toLowerCase();
+    if (profile.ssid !== selectedSsid || !bssid || visibleBssids.has(bssid)) continue;
+    const option = new Option(`${profile.bssid} | 保存済み・現在未検出`, profile.bssid);
+    option.dataset.ssid = profile.ssid;
+    options.push(option);
+  }
+  setSelectOptions(bssidSwitchSelect, options, "同一SSID内のBSSIDを選択");
+  if (bssidSwitchStatus && selectedSsid) {
+    bssidSwitchStatus.textContent = `BSSID候補: ${selectedSsid}`;
+  }
+}
+
 async function loadAccessPointCandidates() {
   if (measurementModeSelect?.value === "remote_ssh" || !state.localBssidSwitchSupported) return;
   try {
     if (refreshBssidBtn) refreshBssidBtn.disabled = true;
-    if (apSwitchStatus) apSwitchStatus.textContent = "候補APを取得中...";
+    if (apSwitchStatus) apSwitchStatus.textContent = "Wi-Fi候補を取得中...";
     const response = await fetch("/api/local/access-points");
     const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "候補APの取得に失敗しました");
+    if (!response.ok) throw new Error(data.detail || "Wi-Fi候補の取得に失敗しました");
     state.currentWifi = data.current || {};
     state.bssidSwitchEnabledSsid = data.bssid_switch_enabled_ssid || "";
     state.bssidLock = data.bssid_lock || {};
     state.apLock = data.ap_lock || {};
     const accessPoints = data.access_points || [];
-    const ssids = [...new Set(accessPoints.map((ap) => ap.ssid).filter(Boolean))].sort();
+    state.accessPoints = accessPoints;
+    state.savedWifiProfiles = data.saved_profiles || [];
+    const savedSsids = data.saved_ssids || [];
+    const ssids = [
+      ...new Set([...accessPoints.map((ap) => ap.ssid), ...savedSsids].filter(Boolean)),
+    ].sort();
     setSelectOptions(
       apSwitchSelect,
       ssids.map((ssid) => new Option(ssid, ssid)),
       "接続先SSIDを選択",
     );
     const currentSsid = state.currentWifi.ssid || "";
-    setSelectOptions(
-      bssidSwitchSelect,
-      accessPoints
-        .filter((ap) => ap.ssid === currentSsid)
-        .map((ap) => {
-          const label = `${ap.bssid} | CH ${ap.channel || "-"} | ${ap.signal || "-"}%`;
-          const option = new Option(label, ap.bssid || "");
-          option.dataset.ssid = ap.ssid || "";
-          return option;
-        }),
-      "同一SSID内のBSSIDを選択",
-    );
+    renderBssidCandidates();
+    if (currentWifiStatus) currentWifiStatus.textContent = `現在接続中: ${currentWifiSummary()}`;
     if (apSwitchStatus) {
-      apSwitchStatus.textContent = state.apLock.locked === "yes"
-        ? `AP固定中: ${state.apLock.ssid || currentSsid || "-"} (${state.apLock.connection || "接続プロファイル"})`
-        : `現在: ${currentSsid || "-"} / ${state.currentWifi.bssid || "-"}`;
+      setWifiOperationStatus(apSwitchStatus, state.apLock.locked === "yes"
+        ? `SSID固定中: ${state.apLock.ssid || "-"}（他${state.apLock.disabled_count || "0"}プロファイルの自動接続を停止）`
+        : "接続先を選択して操作してください。");
     }
-    if (bssidSwitchStatus) {
+    if (bssidSwitchStatus && !apSwitchSelect?.value) {
       bssidSwitchStatus.textContent = state.bssidLock.bssid
         ? `固定中: ${state.bssidLock.bssid} (${state.bssidLock.connection || "接続プロファイル"})`
         : bssidTestEnabledMessage(currentSsid);
     }
   } catch (error) {
-    if (apSwitchStatus) apSwitchStatus.textContent = error.message;
+    setWifiOperationStatus(apSwitchStatus, `候補更新失敗: ${error.message}`, "error");
+    if (currentWifiStatus) currentWifiStatus.textContent = "現在接続中: 取得失敗";
   } finally {
     syncBssidSwitchState();
   }
 }
 
 function bssidTestEnabledMessage(currentSsid) {
-  return state.bssidSwitchEnabledSsid === currentSsid && currentSsid
-    ? `BSSIDテスト有効: ${currentSsid}`
-    : "APを切り替えると、同一SSID内のBSSIDテストを有効にできます。";
+  return currentSsid
+    ? `BSSID指定可能: ${currentSsid}`
+    : "Wi-Fiへ接続すると、同一SSID内のBSSIDを指定できます。";
 }
 
 async function handleApSwitch() {
@@ -443,62 +495,84 @@ async function handleApSwitch() {
   if (!window.confirm(`Jetsonの接続先を ${ssid} へ切り替えます。USBまたは有線LANで接続中であることを確認してください。`)) return;
   try {
     if (switchApBtn) switchApBtn.disabled = true;
-    if (apSwitchStatus) apSwitchStatus.textContent = "APを切り替え中...";
+    setWifiOperationStatus(apSwitchStatus, `${ssid} へ接続中...`);
     const response = await fetch("/api/local/switch-ap", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ssid, password: password || null, acknowledged_usb_or_lan: true }),
     });
     const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "AP切替に失敗しました");
+    if (!response.ok) throw new Error(data.detail || "SSIDへの接続に失敗しました");
     if (form.ssid && data.connected?.ssid) form.ssid.value = data.connected.ssid;
     if (apSwitchPassword) apSwitchPassword.value = "";
-    if (apSwitchStatus) apSwitchStatus.textContent = `AP切替完了: ${data.connected?.ssid || ssid}`;
     await loadAccessPointCandidates();
+    setWifiOperationStatus(
+      apSwitchStatus,
+      `接続成功: ${data.connected?.ssid || ssid} / ${data.connected?.bssid || "-"}`,
+      "success",
+    );
   } catch (error) {
-    if (apSwitchStatus) apSwitchStatus.textContent = error.message;
+    await loadAccessPointCandidates();
+    setWifiOperationStatus(
+      apSwitchStatus,
+      `接続失敗: ${error.message}（現在接続中: ${currentWifiSummary()}）`,
+      "error",
+    );
   } finally {
     syncBssidSwitchState();
   }
 }
 
 async function handleApFix() {
-  if (!window.confirm("現在接続中のAP（SSID）を自動接続の最優先に固定します。USBまたは有線LANで接続中であることを確認してください。")) return;
+  const ssid = apSwitchSelect?.value || "";
+  if (!ssid) return;
+  if (!window.confirm(`${ssid} へ接続し、他SSIDへの自動接続を停止します。USBまたは有線LANで接続中であることを確認してください。`)) return;
   try {
     if (fixApBtn) fixApBtn.disabled = true;
-    if (apSwitchStatus) apSwitchStatus.textContent = "APを固定中...";
+    setWifiOperationStatus(apSwitchStatus, `${ssid} へ接続・固定中...`);
     const response = await fetch("/api/local/fix-ap", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ acknowledged_usb_or_lan: true }),
+      body: JSON.stringify({ ssid, acknowledged_usb_or_lan: true }),
     });
     const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "AP固定に失敗しました");
+    if (!response.ok) throw new Error(data.detail || "SSID固定に失敗しました");
     state.apLock = data.ap_lock || {};
-    if (apSwitchStatus) apSwitchStatus.textContent = `APを固定しました: ${state.apLock.ssid || "-"}`;
+    await loadAccessPointCandidates();
+    setWifiOperationStatus(
+      apSwitchStatus,
+      `接続・固定成功: ${data.connected?.ssid || ssid} / ${data.connected?.bssid || "-"}`,
+      "success",
+    );
   } catch (error) {
-    if (apSwitchStatus) apSwitchStatus.textContent = error.message;
+    await loadAccessPointCandidates();
+    setWifiOperationStatus(
+      apSwitchStatus,
+      `接続・固定失敗: ${error.message}（現在接続中: ${currentWifiSummary()}）`,
+      "error",
+    );
   } finally {
     syncBssidSwitchState();
   }
 }
 
 async function handleClearApFix() {
-  if (!window.confirm("APの自動接続優先を通常値へ戻します。USBまたは有線LANで接続中であることを確認してください。")) return;
+  if (!window.confirm("SSID固定を解除し、保存済みWi-Fiの自動接続設定を元に戻しますか？")) return;
   try {
     if (clearApFixBtn) clearApFixBtn.disabled = true;
-    if (apSwitchStatus) apSwitchStatus.textContent = "AP固定を解除中...";
+    setWifiOperationStatus(apSwitchStatus, "SSID固定を解除して設定を復元中...");
     const response = await fetch("/api/local/clear-ap-fix", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ acknowledged_usb_or_lan: true }),
     });
     const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "AP固定の解除に失敗しました");
+    if (!response.ok) throw new Error(data.detail || "SSID固定の解除に失敗しました");
     state.apLock = data.ap_lock || {};
-    if (apSwitchStatus) apSwitchStatus.textContent = "AP固定を解除しました。";
+    await loadAccessPointCandidates();
+    setWifiOperationStatus(apSwitchStatus, "SSID固定を解除し、自動接続設定を復元しました。", "success");
   } catch (error) {
-    if (apSwitchStatus) apSwitchStatus.textContent = error.message;
+    setWifiOperationStatus(apSwitchStatus, `SSID固定解除失敗: ${error.message}`, "error");
   } finally {
     syncBssidSwitchState();
   }
@@ -509,22 +583,31 @@ async function handleBssidSwitch() {
   const ssid = selected?.dataset?.ssid || "";
   const bssid = selected?.value || "";
   if (!ssid || !bssid) return;
-  if (!window.confirm(`JetsonのWi-Fiを ${ssid} / ${bssid} へ切り替えます。USBまたは有線LANで接続中であることを確認してください。`)) return;
+  if (!window.confirm(`JetsonのWi-Fiを ${ssid} / ${bssid} へ切り替えて固定します。USBまたは有線LANで接続中であることを確認してください。`)) return;
   try {
     if (switchBssidBtn) switchBssidBtn.disabled = true;
-    if (bssidSwitchStatus) bssidSwitchStatus.textContent = "BSSIDを切り替え中...";
+    setWifiOperationStatus(bssidSwitchStatus, "BSSIDを切り替えて固定中...");
     const response = await fetch("/api/local/switch-bssid", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ssid, bssid, acknowledged_usb_or_lan: true }),
     });
     const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "BSSID切替に失敗しました");
+    if (!response.ok) throw new Error(data.detail || "BSSIDの切替・固定に失敗しました");
     if (form.ssid && data.connected?.ssid) form.ssid.value = data.connected.ssid;
-    if (bssidSwitchStatus) bssidSwitchStatus.textContent = `切替完了: ${data.connected?.ssid || ssid} / ${data.connected?.bssid || bssid}`;
     await loadAccessPointCandidates();
+    setWifiOperationStatus(
+      bssidSwitchStatus,
+      `切替・固定成功: ${data.connected?.ssid || ssid} / ${data.connected?.bssid || bssid}`,
+      "success",
+    );
   } catch (error) {
-    if (bssidSwitchStatus) bssidSwitchStatus.textContent = error.message;
+    await loadAccessPointCandidates();
+    setWifiOperationStatus(
+      bssidSwitchStatus,
+      `切替・固定失敗: ${error.message}（現在接続中: ${currentWifiSummary()}）`,
+      "error",
+    );
   } finally {
     syncBssidSwitchState();
   }
@@ -625,6 +708,7 @@ async function triggerSessionReset() {
     state.running = Boolean(status.running);
     state.points = [];
     state.segments = [];
+    state.pointAdvancePending = false;
     state.logsByPoint = new Map();
     state.liveBuffer = [];
     liveLog.textContent = "";
@@ -653,7 +737,20 @@ async function handleStart() {
     const status = await resp.json();
     state.running = true;
     state.pointOffset = Math.max(0, (status.current_point || 1) - 1);
+    state.points = [];
+    state.segments = [];
+    state.pointAdvancePending = false;
+    state.logsByPoint = new Map();
+    state.liveBuffer = [];
+    liveLog.textContent = "";
+    renderAll();
     updateStatus(status);
+    if (payload.measurement_mode === "local" && payload.exclusive_ssid_during_measurement) {
+      state.apLock = { locked: "yes", ssid: payload.ssid || "", disabled_count: "-" };
+      if (apSwitchStatus) {
+        apSwitchStatus.textContent = `測定中SSID固定: ${payload.ssid || "-"}`;
+      }
+    }
     startBtn.disabled = true;
     stopBtn.disabled = false;
   } catch (error) {
@@ -671,6 +768,9 @@ async function handleStop() {
     state.running = false;
     state.pointOffset = Math.max(0, (status.current_point || 1) - 1);
     updateStatus(status);
+    if (status.config?.measurement_mode === "local") {
+      await loadAccessPointCandidates();
+    }
     startBtn.disabled = false;
     stopBtn.disabled = false;
   } catch (error) {
@@ -725,6 +825,7 @@ function buildPayload() {
     "use_sudo",
     "sync_time",
     "auto_reconnect_wifi",
+    "exclusive_ssid_during_measurement",
     "remote_enable_neighbor_scan",
     "remote_setup_ssh_key",
     "remote_cleanup_ssh_key",
@@ -773,7 +874,7 @@ function buildPayload() {
   payload.retain_rows = Number(fd.get("retain_rows")) || 20000;
   payload.remote_advanced_ping_timeout_streak = Number(fd.get("remote_advanced_ping_timeout_streak")) || 1;
   payload.remote_advanced_max_output_chars = Number(fd.get("remote_advanced_max_output_chars")) || 12000;
-  payload.wifi_reconnect_cooldown_sec = Number(fd.get("wifi_reconnect_cooldown_sec")) || 15;
+  payload.wifi_reconnect_cooldown_sec = Number(fd.get("wifi_reconnect_cooldown_sec")) || 5;
   return payload;
 }
 
@@ -904,8 +1005,12 @@ function formatPingDisplay(value, status) {
   }
   return `${Math.round(numeric)}ms`;
 }
-function handleCanvasClick(event) {
+async function handleCanvasClick(event) {
   if (state.view.panMode) {
+    return;
+  }
+  if (state.pointAdvancePending) {
+    statusMessage.textContent = "Point更新中です。完了してから次のPointを押してください。";
     return;
   }
   const rect = canvas.getBoundingClientRect();
@@ -916,10 +1021,28 @@ function handleCanvasClick(event) {
   const world = fromScreenToWorld(screenX, screenY);
   const x = Math.round(world.x);
   const y = Math.round(world.y);
-  state.points.push({ x, y });
-  renderAll();
-  if (state.points.length >= 2) {
-    finalizeSegment();
+  const end = { x, y };
+
+  if (!state.running || state.points.length === 0) {
+    state.points.push(end);
+    renderAll();
+    return;
+  }
+
+  const start = { ...state.points[state.points.length - 1] };
+  state.points.push(end);
+  state.pointAdvancePending = true;
+  canvas.style.cursor = "wait";
+  statusMessage.textContent = "Point更新中...";
+  try {
+    await finalizeSegment(start, end);
+  } catch (error) {
+    state.points.pop();
+    renderAll();
+    statusMessage.textContent = error.message;
+  } finally {
+    state.pointAdvancePending = false;
+    canvas.style.cursor = state.view.panMode ? "grab" : "crosshair";
   }
 }
 
@@ -1000,39 +1123,55 @@ function handleCanvasMouseUp() {
   canvas.style.cursor = state.view.panMode ? "grab" : "crosshair";
 }
 
-async function finalizeSegment() {
-  try {
-    const resp = await fetch("/api/advance-point", { method: "POST" });
-    if (!resp.ok) {
-      const data = await resp.json();
-      throw new Error(data.detail || "advance failed");
-    }
-    const payload = await resp.json();
-    const completed = payload.completed_point;
-    const logs = await ensureLogs(completed);
-    if (!logs.length) {
-      return;
-    }
+async function finalizeSegment(start, end) {
+  // Advance first, then finish the UI from the WebSocket cache without waiting on another API round trip.
+  const resp = await fetch("/api/advance-point", { method: "POST" });
+  if (!resp.ok) {
+    const data = await resp.json();
+    throw new Error(data.detail || "advance failed");
+  }
+  const payload = await resp.json();
+  const completed = payload.completed_point;
+  const cachedLogs = state.logsByPoint.get(completed) || [];
+  const segment = {
+    pointId: completed,
+    start: { ...start },
+    end: { ...end },
+    logs: cachedLogs.length ? [...cachedLogs] : [buildNoDataLog(completed)],
+  };
+  state.segments.push(segment);
+  scheduleRenderAll();
+  statusMessage.textContent = `Point=${payload.current_point} | P${completed}区間を確定`;
 
-    // completed point id to local points index.
-    const startIdx = completed - 1 - state.pointOffset;
-    const endIdx = completed - state.pointOffset;
-    const startPoint = state.points[startIdx];
-    const endPoint = state.points[endIdx];
-    if (!startPoint || !endPoint) {
-      statusMessage.textContent = "Point alignment error. Please retry by placing points again.";
-      return;
-    }
-    const start = { ...startPoint };
-    const end = { ...endPoint };
-    state.segments.push({ pointId: completed, start, end, logs });
-    renderAll();
+  // Reconcile with the server after releasing point input; this also picks up a sample
+  // that was written immediately before the point counter changed.
+  void refreshSegmentLogs(segment);
+}
+
+async function refreshSegmentLogs(segment) {
+  try {
+    const logs = await ensureLogs(segment.pointId);
+    if (!logs.length || !state.segments.includes(segment)) return;
+    segment.logs = [...logs];
+    scheduleRenderAll();
   } catch (error) {
-    statusMessage.textContent = error.message;
+    console.error("segment log refresh", error);
   }
 }
 
+function scheduleRenderAll() {
+  if (state.renderFrame !== null) return;
+  state.renderFrame = window.requestAnimationFrame(() => {
+    state.renderFrame = null;
+    renderAll();
+  });
+}
+
 async function handleUndoLastPoint() {
+  if (state.pointAdvancePending) {
+    statusMessage.textContent = "Point更新中は取り消せません。";
+    return;
+  }
   if (!state.points.length) {
     statusMessage.textContent = "Undo target is not available.";
     return;
@@ -1277,6 +1416,17 @@ function buildImportedPointLog(sample) {
   };
 }
 
+function buildNoDataLog(pointId) {
+  return {
+    point: pointId,
+    ping_ms: "",
+    signal_strength: "",
+    rssi_dbm: "",
+    bssid: "",
+    status: "no_data",
+  };
+}
+
 function findNearestSampleIndex(samples, targetTimeMs, startIdx = 0) {
   let idx = Math.max(0, Math.min(startIdx, Math.max(0, samples.length - 1)));
   while (idx + 1 < samples.length && samples[idx + 1].timestamp.getTime() <= targetTimeMs) {
@@ -1345,14 +1495,13 @@ async function handleImportAlignedLogs() {
     let cursor = 0;
     let matchedCount = 0;
 
-    Array.from(byPoint.keys())
-      .sort((a, b) => a - b)
-      .forEach((pointId) => {
+    const maxPointId = Math.max(...byPoint.keys());
+    for (let pointId = 1; pointId <= maxPointId; pointId += 1) {
         const samples = byPoint.get(pointId) || [];
         const start = state.points[pointId - 1];
         const end = state.points[pointId];
         if (!start || !end) {
-          return;
+          continue;
         }
         const logs = samples.map((sample) => {
           let matched = null;
@@ -1370,9 +1519,12 @@ async function handleImportAlignedLogs() {
           }
           return buildAlignedLog(sample, matched);
         });
+        if (!logs.length) {
+          logs.push(buildNoDataLog(pointId));
+        }
         state.logsByPoint.set(pointId, logs);
         state.segments.push({ pointId, start: { ...start }, end: { ...end }, logs });
-      });
+    }
 
     renderAll();
     statusMessage.textContent = overlayFile
@@ -1415,20 +1567,22 @@ async function handleImportPointLogs() {
     let importedSegments = 0;
     let skippedPoints = 0;
 
-    Array.from(byPoint.keys())
-      .sort((a, b) => a - b)
-      .forEach((pointId) => {
+    const maxPointId = Math.max(...byPoint.keys());
+    for (let pointId = 1; pointId <= maxPointId; pointId += 1) {
         const start = state.points[pointId - 1];
         const end = state.points[pointId];
         if (!start || !end) {
           skippedPoints += 1;
-          return;
+          continue;
         }
         const logs = (byPoint.get(pointId) || []).map(buildImportedPointLog);
+        if (!logs.length) {
+          logs.push(buildNoDataLog(pointId));
+        }
         state.logsByPoint.set(pointId, logs);
         state.segments.push({ pointId, start: { ...start }, end: { ...end }, logs });
         importedSegments += 1;
-      });
+    }
 
     renderAll();
     statusMessage.textContent =
@@ -1463,6 +1617,7 @@ async function handleResetMap() {
   const clearClientState = () => {
     state.points = [];
     state.segments = [];
+    state.pointAdvancePending = false;
     state.logsByPoint = new Map();
     state.liveBuffer = [];
     liveLog.textContent = "";
@@ -1542,6 +1697,10 @@ function drawPointLabels(targetCtx = ctx) {
 function drawSegment(segment, mode = state.currentMode, targetCtx = ctx) {
   const logs = segment.logs;
   if (!logs || logs.length === 0) return;
+  if (logs.every((log) => normalizeStatus(log.status) === "no_data")) {
+    drawNoDataSegment(segment, targetCtx);
+    return;
+  }
   if (state.display.plotShape === "strip") {
     drawStripSegment(segment, mode, targetCtx);
     return;
@@ -1552,11 +1711,30 @@ function drawSegment(segment, mode = state.currentMode, targetCtx = ctx) {
   });
 }
 
+function drawNoDataSegment(segment, targetCtx) {
+  const start = fromWorldToScreen(segment.start.x, segment.start.y);
+  const end = fromWorldToScreen(segment.end.x, segment.end.y);
+  targetCtx.save();
+  targetCtx.strokeStyle = NO_DATA_COLOR;
+  targetCtx.lineWidth = Math.max(state.display.plotRadius * 2, 2);
+  targetCtx.lineCap = "round";
+  targetCtx.beginPath();
+  targetCtx.moveTo(start.x, start.y);
+  targetCtx.lineTo(end.x, end.y);
+  targetCtx.stroke();
+  targetCtx.restore();
+}
+
 function drawDotSample(coord, log, mode, targetCtx) {
   const color = resolveColor(mode, log);
   if (!color) return;
   const screen = fromWorldToScreen(coord.x, coord.y);
   targetCtx.fillStyle = color;
+  if (normalizeStatus(log.status) === "wifi_disconnected") {
+    const size = state.display.plotRadius * 2;
+    targetCtx.fillRect(screen.x - size / 2, screen.y - size / 2, size, size);
+    return;
+  }
   targetCtx.beginPath();
   targetCtx.arc(screen.x, screen.y, state.display.plotRadius, 0, Math.PI * 2);
   targetCtx.fill();
@@ -1621,7 +1799,15 @@ function normalizeMode(mode) {
   return raw;
 }
 
+function normalizeStatus(status) {
+  return String(status || "").trim().toLowerCase();
+}
+
 function resolveColor(mode, log) {
+  const status = normalizeStatus(log.status);
+  if (status === "no_data") return NO_DATA_COLOR;
+  if (status === "wifi_disconnected") return WIFI_DISCONNECTED_COLOR;
+  if (status === "ping_timeout" || status === "timeout") return PING_TIMEOUT_COLOR;
   const modeKey = normalizeMode(mode);
   const pingCap = 30;
   const ping300Cap = 300;
@@ -1706,6 +1892,20 @@ const ping300Gradient = [
   { value: 250, color: "#ff7043" },
   { value: 300, color: "#d32f2f" },
 ];
+
+const WIFI_DISCONNECTED_COLOR = "#424851";
+const PING_TIMEOUT_COLOR = "#ff4d22";
+const NO_DATA_COLOR = "#b8bec6";
+const statusLegendConfig = {
+  label: "Status",
+  type: "steps",
+  steps: [
+    { label: "Ping timeout", color: PING_TIMEOUT_COLOR },
+    { label: "Wi-Fi disconnected", color: WIFI_DISCONNECTED_COLOR },
+    { label: "No data", color: NO_DATA_COLOR },
+  ],
+  reverseSteps: false,
+};
 
 const signalStops = [
   { value: 0, color: "#c20000" },
@@ -1888,6 +2088,7 @@ function renderLegend() {
   } else if (config.type === "steps") {
     legendContainer.appendChild(createStepLegend(config));
   }
+  legendContainer.appendChild(createStepLegend(statusLegendConfig));
 }
 
 function createVerticalGradientLegend(config) {
@@ -2112,7 +2313,9 @@ function buildExportCanvas(modeKey, baseTitle) {
   const margin = 80;
   const includeTitle = titleToggle ? titleToggle.checked : true;
   const titleHeight = includeTitle && finalTitle ? 220 : 0;
-  const legendWidth = legendConfig ? estimateLegendExportWidth(legendConfig) : 0;
+  const legendWidth = legendConfig
+    ? Math.max(estimateLegendExportWidth(legendConfig), estimateLegendExportWidth(statusLegendConfig))
+    : 0;
   const legendGap = legendConfig ? 60 : 0;
   const totalWidth = canvas.width + legendWidth + legendGap + margin * 2;
   const totalHeight = canvas.height + margin * 2 + titleHeight;
@@ -2159,8 +2362,20 @@ function buildExportCanvas(modeKey, baseTitle) {
   if (legendConfig) {
     const legendX = mapX + canvas.width + legendGap;
     const legendY = mapY;
+    const statusGap = 36;
+    const statusHeight = Math.max(360, Math.round(canvas.height * 0.26));
+    const metricHeight = Math.max(360, canvas.height - statusHeight - statusGap);
     // The mode label is already in the export title, so hide duplicated legend axis label.
-    drawLegendOnCanvas(tempCtx, legendConfig, legendX, legendY, canvas.height, legendWidth, { showAxisLabel: false });
+    drawLegendOnCanvas(tempCtx, legendConfig, legendX, legendY, metricHeight, legendWidth, { showAxisLabel: false });
+    drawLegendOnCanvas(
+      tempCtx,
+      statusLegendConfig,
+      legendX,
+      legendY + metricHeight + statusGap,
+      statusHeight,
+      legendWidth,
+      { showAxisLabel: false },
+    );
   }
   return { canvas: tempCanvas, modeLabel };
 }
@@ -2361,7 +2576,7 @@ function initDisplayControls() {
   });
   if (plotShapeSelect) {
     plotShapeSelect.addEventListener("change", (event) => {
-      state.display.plotShape = event.target.value || "dot";
+      state.display.plotShape = event.target.value || "strip";
       renderAll();
     });
   }
@@ -2419,5 +2634,3 @@ init().catch((error) => {
     statusMessage.textContent = `初期化失敗: ${error?.message || "unknown"}`;
   }
 });
-
-

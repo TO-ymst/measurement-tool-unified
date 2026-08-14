@@ -5,7 +5,7 @@ import csv
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -48,18 +48,18 @@ service = MeasurementService()
 
 class HidePointRequest(BaseModel):
     point_id: int
-    source_csv: str | None = None
+    source_csv: Optional[str] = None
 
 
 class RemoteSetupRequest(BaseModel):
     remote_host: str
     remote_user: str = DEFAULT_REMOTE_USER
     remote_port: int = DEFAULT_REMOTE_PORT
-    remote_identity_file: str | None = None
+    remote_identity_file: Optional[str] = None
     remote_setup_ssh_key: bool = True
     remote_cleanup_ssh_key: bool = True
     remote_delete_local_key: bool = True
-    remote_ssh_key_comment: str | None = None
+    remote_ssh_key_comment: Optional[str] = None
 
 
 class BssidSwitchRequest(BaseModel):
@@ -70,15 +70,16 @@ class BssidSwitchRequest(BaseModel):
 
 class ApSwitchRequest(BaseModel):
     ssid: str
-    password: str | None = None
+    password: Optional[str] = None
     acknowledged_usb_or_lan: bool = False
 
 
 class BssidLockRequest(BaseModel):
     acknowledged_usb_or_lan: bool = False
+    ssid: Optional[str] = None
 
 
-def _resolve_source_csv_path(source_csv: str | None) -> Path:
+def _resolve_source_csv_path(source_csv: Optional[str]) -> Path:
     if source_csv:
         path = Path(source_csv).expanduser()
     else:
@@ -140,7 +141,7 @@ async def read_defaults() -> Dict[str, Any]:
     ssid_options = list_available_ssids(use_sudo=DEFAULT_USE_SUDO)
     return {
         "measurement_mode": DEFAULT_MEASUREMENT_MODE,
-        "ssid": current_ssid or DEFAULT_SSID,
+        "ssid": current_ssid or "",
         "ssid_options": ssid_options,
         "band": DEFAULT_BAND,
         "channel_min": CHANNEL_FILTER[DEFAULT_BAND]["min"],
@@ -152,7 +153,9 @@ async def read_defaults() -> Dict[str, Any]:
         "wifi_disconnected_value": DEFAULT_WIFI_DISCONNECTED_VALUE,
         "auto_reconnect_wifi": True,
         "wifi_reconnect_cooldown_sec": DEFAULT_WIFI_RECONNECT_COOLDOWN_SEC,
+        "exclusive_ssid_during_measurement": True,
         "log_base": DEFAULT_LOG_BASE,
+        "output_dir": str(BASE_DIR.parent),
         "timezone": DEFAULT_TIMEZONE,
         "timezone_options": ["Asia/Tokyo", "Etc/GMT"],
         "bands": CHANNEL_FILTER,
@@ -160,7 +163,7 @@ async def read_defaults() -> Dict[str, Any]:
         "remote_user": DEFAULT_REMOTE_USER,
         "remote_port": DEFAULT_REMOTE_PORT,
         "remote_identity_file": "",
-        "remote_enable_neighbor_scan": True,
+        "remote_enable_neighbor_scan": False,
         "remote_neighbor_every": DEFAULT_REMOTE_NEIGHBOR_EVERY,
         "remote_neighbor_ssid": "",
         "remote_setup_ssh_key": True,
@@ -282,7 +285,7 @@ async def fix_local_ap(payload: BssidLockRequest):
     if not payload.acknowledged_usb_or_lan:
         raise HTTPException(status_code=400, detail="Confirm that the dashboard is connected through USB or wired LAN")
     try:
-        return service.fix_local_ap()
+        return service.fix_local_ap(payload.ssid)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -385,5 +388,7 @@ async def websocket_logs(websocket: WebSocket):
         while True:
             record = await queue.get()
             await websocket.send_json(record)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        pass
+    finally:
         service.unregister_listener(queue)

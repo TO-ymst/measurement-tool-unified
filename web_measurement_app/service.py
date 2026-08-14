@@ -8,7 +8,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, TextIO, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set, TextIO, Tuple
 
 import subprocess
 
@@ -37,17 +37,21 @@ from .logger_core import (
     DEFAULT_WIFI_RECONNECT_COOLDOWN_SEC,
     DEFAULT_WIFI_DISCONNECTED_VALUE,
     HEADERS,
+    IW_HEADERS,
     NEIGHBOR_HEADERS,
     apply_neighbor_summary,
     collect_remote_advanced_snapshot,
     ensure_remote_ssh_key,
     fetch_remote_wifi_state,
+    fetch_local_iw_station_info,
+    fetch_local_iw_tx_power,
     fetch_wifi_rows,
     get_current_local_wifi_state,
     get_local_wifi_ap_lock,
     get_local_wifi_bssid_lock,
     get_ping_result,
     IS_WINDOWS,
+    list_saved_local_wifi_profiles,
     prepare_connection_event_file,
     prepare_neighbor_log_file,
     prepare_log_file,
@@ -81,9 +85,10 @@ class MeasurementConfig(BaseModel):
     wifi_disconnected_value: float = Field(default=DEFAULT_WIFI_DISCONNECTED_VALUE)
     auto_reconnect_wifi: bool = Field(default=True)
     wifi_reconnect_cooldown_sec: int = Field(default=DEFAULT_WIFI_RECONNECT_COOLDOWN_SEC, ge=5, le=3600)
+    exclusive_ssid_during_measurement: bool = Field(default=True)
     prefix: Optional[str] = None
     log_base: str = Field(default=DEFAULT_LOG_BASE)
-    output_dir: str = Field(default=".")
+    output_dir: str = Field(default_factory=lambda: str(Path(__file__).resolve().parent.parent))
     use_sudo: bool = Field(default=DEFAULT_USE_SUDO)
     sync_time: bool = Field(default=False)
     timezone: str = Field(default=DEFAULT_TIMEZONE)
@@ -92,7 +97,7 @@ class MeasurementConfig(BaseModel):
     remote_user: str = Field(default=DEFAULT_REMOTE_USER)
     remote_port: int = Field(default=DEFAULT_REMOTE_PORT, ge=1, le=65535)
     remote_identity_file: Optional[str] = None
-    remote_enable_neighbor_scan: bool = Field(default=True)
+    remote_enable_neighbor_scan: bool = Field(default=False)
     remote_setup_ssh_key: bool = Field(default=True)
     remote_cleanup_ssh_key: bool = Field(default=True)
     remote_delete_local_key: bool = Field(default=True)
@@ -232,9 +237,15 @@ class MeasurementService:
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._network_switch_lock = threading.Lock()
+        self._local_reconnect_lock = threading.Lock()
+        self._local_reconnect_thread: Optional[threading.Thread] = None
+        self._neighbor_scan_lock = threading.Lock()
+        self._neighbor_scan_thread: Optional[threading.Thread] = None
+        self._pending_neighbor_result: Optional[Dict[str, Any]] = None
+        self._neighbor_scan_generation = 0
         self._current_point = 1
         self._log_index = 0
-        self._listeners: set[asyncio.Queue] = set()
+        self._listeners: Set[asyncio.Queue] = set()
         self._history: Dict[int, Deque[Dict[str, Any]]] = defaultdict(deque)
         self._config: Optional[MeasurementConfig] = None
         self._log_path: Optional[Path] = None
@@ -254,6 +265,8 @@ class MeasurementService:
         self._bssid_switch_enabled_ssid: Optional[str] = None
         self._last_bssid_switch: Optional[Dict[str, str]] = None
         self._last_wifi_reconnect_attempt = 0.0
+        self._measurement_ssid_lock_owned = False
+        self._last_iw_counters: Optional[Dict[str, Any]] = None
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -275,6 +288,8 @@ class MeasurementService:
             self._connection_event_path = prepare_connection_event_file(self._log_path)
             self._neighbor_log_index = 0
             self._neighbor_scan_index = 0
+            self._neighbor_scan_generation += 1
+            self._pending_neighbor_result = None
             self._advanced_log_path = (
                 prepare_sidecar_file(prefix, f"{config.log_base}_remote_advanced", config.output_dir, ".jsonl")
                 if config.measurement_mode == "remote_ssh" and config.remote_advanced_enabled
@@ -284,6 +299,7 @@ class MeasurementService:
             self._remote_ping_timeout_streak = 0
             self._remote_timeout_snapshot_taken = False
             self._last_wifi_reconnect_attempt = 0.0
+            self._last_iw_counters = None
             with self._connection_event_path.open("w", newline="", encoding="utf-8-sig") as event_file:
                 csv.writer(event_file).writerow(CONNECTION_EVENT_HEADERS)
 
@@ -309,9 +325,34 @@ class MeasurementService:
                     config.ping_target, config.auto_gateway, DEFAULT_PING_TARGET
                 )
 
-            self._original_timezone = synchronize_time(config.timezone) if config.sync_time else None
-            self._thread = threading.Thread(target=self._run_loop, name="wifi-logger", daemon=True)
-            self._thread.start()
+            self._measurement_ssid_lock_owned = False
+            if config.measurement_mode == "local" and config.exclusive_ssid_during_measurement:
+                current_wifi = get_current_local_wifi_state(config.use_sudo)
+                current_ssid = str(current_wifi.get("ssid", "")).strip()
+                if current_ssid != config.ssid:
+                    raise RuntimeError(
+                        f"Current Wi-Fi SSID is {current_ssid or 'not connected'}; "
+                        f"connect to {config.ssid} before starting measurement"
+                    )
+                existing_lock = get_local_wifi_ap_lock(config.use_sudo)
+                if existing_lock["locked"] == "yes":
+                    if existing_lock["ssid"] != config.ssid:
+                        raise RuntimeError(
+                            f"SSID is locked to {existing_lock['ssid']}; release it before measuring {config.ssid}"
+                        )
+                else:
+                    set_local_wifi_ap_lock(config.use_sudo, True)
+                    self._measurement_ssid_lock_owned = True
+
+            try:
+                self._original_timezone = synchronize_time(config.timezone) if config.sync_time else None
+                self._thread = threading.Thread(target=self._run_loop, name="wifi-logger", daemon=True)
+                self._thread.start()
+            except Exception:
+                if self._measurement_ssid_lock_owned:
+                    set_local_wifi_ap_lock(config.use_sudo, False)
+                    self._measurement_ssid_lock_owned = False
+                raise
         return self.status()
 
     def stop(self) -> MeasurementStatus:
@@ -319,8 +360,23 @@ class MeasurementService:
             self._stop_event.set()
             thread = self._thread
             config = self._config
+        with self._local_reconnect_lock:
+            reconnect_thread = self._local_reconnect_thread
         if thread and thread.is_alive():
             thread.join(timeout=5)
+        if reconnect_thread and reconnect_thread.is_alive():
+            reconnect_thread.join(timeout=5)
+        if (
+            config
+            and config.measurement_mode == "local"
+            and self._measurement_ssid_lock_owned
+        ):
+            try:
+                with self._network_switch_lock:
+                    set_local_wifi_ap_lock(config.use_sudo, False)
+                self._measurement_ssid_lock_owned = False
+            except Exception as exc:  # noqa: BLE001
+                self._last_error = f"SSID lock restore failed: {exc}"
         restore_timezone(self._original_timezone)
         if config and config.measurement_mode == "remote_ssh" and config.remote_cleanup_ssh_key:
             try:
@@ -386,6 +442,8 @@ class MeasurementService:
         with self._network_switch_lock:
             current = get_current_local_wifi_state(use_sudo)
             access_points = scan_local_neighbors(use_sudo, None)
+            saved_profiles = list_saved_local_wifi_profiles(use_sudo)
+            saved_ssids = sorted({profile["ssid"] for profile in saved_profiles})
             try:
                 bssid_lock = get_local_wifi_bssid_lock(use_sudo)
             except RuntimeError:
@@ -393,10 +451,18 @@ class MeasurementService:
             try:
                 ap_lock = get_local_wifi_ap_lock(use_sudo)
             except RuntimeError:
-                ap_lock = {"connection": "", "ssid": "", "priority": "0", "locked": "no"}
+                ap_lock = {
+                    "connection": "",
+                    "ssid": "",
+                    "priority": "0",
+                    "locked": "no",
+                    "disabled_count": "0",
+                }
         return {
             "current": current,
             "access_points": access_points,
+            "saved_ssids": saved_ssids,
+            "saved_profiles": saved_profiles,
             "bssid_switch_enabled_ssid": enabled_ssid,
             "bssid_lock": bssid_lock,
             "ap_lock": ap_lock,
@@ -448,37 +514,47 @@ class MeasurementService:
                 )
                 raise
 
-    def fix_local_ap(self) -> Dict[str, Any]:
+    def fix_local_ap(self, ssid: Optional[str] = None) -> Dict[str, Any]:
         if IS_WINDOWS:
             raise RuntimeError("AP locking is available on Jetson/Linux only")
+        normalized_ssid = (ssid or "").strip()
         with self._lock:
             config = self._config
-            enabled_ssid = self._bssid_switch_enabled_ssid
         use_sudo = config.use_sudo if config and config.measurement_mode == "local" else DEFAULT_USE_SUDO
         with self._network_switch_lock:
             current = get_current_local_wifi_state(use_sudo)
-            if not enabled_ssid or str(current.get("ssid", "")).strip() != enabled_ssid:
-                raise RuntimeError("Switch the AP before fixing it")
+            current_ssid = str(current.get("ssid", "")).strip()
+            if normalized_ssid and current_ssid != normalized_ssid:
+                current = switch_local_wifi_ssid(use_sudo, normalized_ssid)
+                current_ssid = str(current.get("ssid", "")).strip()
+                self._refresh_local_ping_target(config)
+            if not current_ssid:
+                raise RuntimeError("Connect to the target SSID before locking it")
+            if normalized_ssid and current_ssid != normalized_ssid:
+                raise RuntimeError("Connected SSID verification failed")
             started_at = dt.datetime.now().isoformat(timespec="seconds")
             started_monotonic = time.monotonic()
             try:
                 lock_info = set_local_wifi_ap_lock(use_sudo, True)
                 self._write_connection_event(
                     started_at,
-                    "ap_lock",
-                    enabled_ssid,
+                    "ssid_lock",
+                    current_ssid,
                     "",
                     current,
                     round((time.monotonic() - started_monotonic) * 1000),
                     "success",
-                    f"connection={lock_info.get('connection', '')};priority={lock_info.get('priority', '')}",
+                    (
+                        f"connection={lock_info.get('connection', '')};"
+                        f"disabled_profiles={lock_info.get('disabled_count', '0')}"
+                    ),
                 )
                 return {"ok": True, "connected": current, "ap_lock": lock_info}
             except Exception as exc:  # noqa: BLE001
                 self._write_connection_event(
                     started_at,
-                    "ap_lock",
-                    enabled_ssid,
+                    "ssid_lock",
+                    current_ssid,
                     "",
                     current,
                     round((time.monotonic() - started_monotonic) * 1000),
@@ -501,19 +577,19 @@ class MeasurementService:
                 lock_info = set_local_wifi_ap_lock(use_sudo, False)
                 self._write_connection_event(
                     started_at,
-                    "ap_unlock",
+                    "ssid_unlock",
                     str(current.get("ssid", "")),
                     "",
                     current,
                     round((time.monotonic() - started_monotonic) * 1000),
                     "success",
-                    f"connection={lock_info.get('connection', '')};priority={lock_info.get('priority', '')}",
+                    "restored_saved_wifi_autoconnect",
                 )
                 return {"ok": True, "connected": current, "ap_lock": lock_info}
             except Exception as exc:  # noqa: BLE001
                 self._write_connection_event(
                     started_at,
-                    "ap_unlock",
+                    "ssid_unlock",
                     str(current.get("ssid", "")),
                     "",
                     current,
@@ -528,21 +604,18 @@ class MeasurementService:
             raise RuntimeError("BSSID switching is available on Jetson/Linux only")
         with self._lock:
             config = self._config
-            running = self._thread is not None and self._thread.is_alive()
-            enabled_ssid = self._bssid_switch_enabled_ssid
-        if not config or config.measurement_mode != "local" or not running:
-            raise RuntimeError("Start local measurement before switching BSSID")
-        if enabled_ssid != ssid.strip():
-            raise RuntimeError("Switch the AP first, then select a BSSID for that same SSID")
+        if config and config.measurement_mode != "local":
+            raise RuntimeError("BSSID switching is available in local measurement mode only")
+        use_sudo = config.use_sudo if config else DEFAULT_USE_SUDO
 
         with self._network_switch_lock:
-            before = get_current_local_wifi_state(config.use_sudo)
+            before = get_current_local_wifi_state(use_sudo)
             if str(before.get("ssid", "")).strip() != ssid.strip():
-                raise RuntimeError("Current SSID does not match the AP selected for BSSID switching")
+                raise RuntimeError("Current SSID does not match the selected BSSID")
             started_at = dt.datetime.now().isoformat(timespec="seconds")
             started_monotonic = time.monotonic()
             try:
-                connected = switch_local_wifi_bssid(config.use_sudo, ssid, bssid)
+                connected = switch_local_wifi_bssid(use_sudo, ssid, bssid)
                 self._refresh_local_ping_target(config)
                 with self._lock:
                     self._last_bssid_switch = {
@@ -583,26 +656,25 @@ class MeasurementService:
             raise RuntimeError("BSSID locking is available on Jetson/Linux only")
         with self._lock:
             config = self._config
-            last_switch = dict(self._last_bssid_switch) if self._last_bssid_switch else None
-        if not config or config.measurement_mode != "local" or not last_switch:
-            raise RuntimeError("Switch a BSSID during local measurement before fixing it")
+        if config and config.measurement_mode != "local":
+            raise RuntimeError("BSSID locking is available in local measurement mode only")
+        use_sudo = config.use_sudo if config else DEFAULT_USE_SUDO
 
         with self._network_switch_lock:
-            current = get_current_local_wifi_state(config.use_sudo)
-            if (
-                str(current.get("ssid", "")) != last_switch["ssid"]
-                or str(current.get("bssid", "")).lower() != last_switch["bssid"]
-            ):
-                raise RuntimeError("The current connection is different from the last switched BSSID")
+            current = get_current_local_wifi_state(use_sudo)
+            current_ssid = str(current.get("ssid", "")).strip()
+            current_bssid = str(current.get("bssid", "")).lower()
+            if not current_ssid or not current_bssid:
+                raise RuntimeError("No connected BSSID was found")
             started_at = dt.datetime.now().isoformat(timespec="seconds")
             started_monotonic = time.monotonic()
             try:
-                lock_info = set_local_wifi_bssid_lock(config.use_sudo, last_switch["bssid"])
+                lock_info = set_local_wifi_bssid_lock(use_sudo, current_bssid)
                 self._write_connection_event(
                     started_at,
                     "bssid_lock",
-                    last_switch["ssid"],
-                    last_switch["bssid"],
+                    current_ssid,
+                    current_bssid,
                     current,
                     round((time.monotonic() - started_monotonic) * 1000),
                     "success",
@@ -705,30 +777,52 @@ class MeasurementService:
         self._last_wifi_reconnect_attempt = now
         return True
 
-    def _ensure_local_wifi_connected(self, config: MeasurementConfig) -> Dict[str, Any]:
-        try:
-            current = get_current_local_wifi_state(config.use_sudo)
-        except RuntimeError:
-            current = {}
-        if str(current.get("ssid", "")) == config.ssid or not self._can_attempt_wifi_reconnect(config):
-            return current
+    def _local_reconnect_running(self) -> bool:
+        with self._local_reconnect_lock:
+            return bool(self._local_reconnect_thread and self._local_reconnect_thread.is_alive())
 
+    def _schedule_local_wifi_reconnect(self, config: MeasurementConfig) -> None:
+        if self._stop_event.is_set() or not self._can_attempt_wifi_reconnect(config):
+            return
+        with self._local_reconnect_lock:
+            if self._local_reconnect_thread and self._local_reconnect_thread.is_alive():
+                return
+            thread = threading.Thread(
+                target=self._reconnect_local_wifi_worker,
+                args=(config,),
+                name="wifi-reconnect",
+                daemon=True,
+            )
+            self._local_reconnect_thread = thread
+            thread.start()
+
+    def _reconnect_local_wifi_worker(self, config: MeasurementConfig) -> None:
         started = time.monotonic()
         timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
+        current: Dict[str, Any] = {}
         try:
-            connected = reconnect_local_wifi(config.use_sudo, config.ssid)
-            self._refresh_local_ping_target(config)
-            self._write_connection_event(
-                timestamp, "wifi_reconnect", config.ssid, "", connected,
-                round((time.monotonic() - started) * 1000), "success", "saved_profile",
-            )
-            return connected
+            with self._network_switch_lock:
+                try:
+                    current = get_current_local_wifi_state(config.use_sudo)
+                except RuntimeError:
+                    current = {}
+                # reconnect_local_wifi also verifies the saved BSSID lock. Do
+                # not accept a same-SSID connection to a different AP here.
+                connected = reconnect_local_wifi(config.use_sudo, config.ssid)
+                self._refresh_local_ping_target(config)
+                self._write_connection_event(
+                    timestamp, "wifi_reconnect", config.ssid, "", connected,
+                    round((time.monotonic() - started) * 1000), "success", "saved_profile",
+                )
         except Exception as exc:  # noqa: BLE001
             self._write_connection_event(
                 timestamp, "wifi_reconnect", config.ssid, "", current,
                 round((time.monotonic() - started) * 1000), "failed", str(exc),
             )
-            return current
+        finally:
+            with self._local_reconnect_lock:
+                if self._local_reconnect_thread is threading.current_thread():
+                    self._local_reconnect_thread = None
 
     def _ensure_remote_wifi_connected(
         self, config: MeasurementConfig, current: Dict[str, Any]
@@ -774,40 +868,54 @@ class MeasurementService:
         sample_no = 0
 
         try:
-            with (
-                open(self._log_path, "w", newline="", encoding="utf-8-sig") as csv_file,
-                open(self._neighbor_log_path, "w", newline="", encoding="utf-8-sig") as neighbor_file,
-            ):
-                writer = csv.writer(csv_file)
-                writer.writerow(HEADERS)
-                neighbor_writer = csv.writer(neighbor_file)
-                neighbor_writer.writerow(NEIGHBOR_HEADERS)
-                advanced_file: Optional[TextIO] = None
-                try:
-                    if self._advanced_log_path:
-                        advanced_file = open(self._advanced_log_path, "w", encoding="utf-8")
+            with open(self._log_path, "w", newline="", encoding="utf-8-sig") as csv_file:
+                with open(self._neighbor_log_path, "w", newline="", encoding="utf-8-sig") as neighbor_file:
+                    writer = csv.writer(csv_file)
+                    writer.writerow(HEADERS)
+                    neighbor_writer = csv.writer(neighbor_file)
+                    neighbor_writer.writerow(NEIGHBOR_HEADERS)
+                    advanced_file: Optional[TextIO] = None
+                    try:
+                        if self._advanced_log_path:
+                            advanced_file = open(self._advanced_log_path, "w", encoding="utf-8")
 
-                    while not self._stop_event.is_set():
-                        sample_no += 1
-                        if config.measurement_mode == "remote_ssh":
-                            record = self._run_remote_iteration(
-                                writer, csv_file, neighbor_writer, config, sample_no
-                            )
-                            if record and advanced_file and config.remote_advanced_enabled:
-                                self._maybe_capture_remote_advanced_snapshot(
-                                    advanced_file=advanced_file,
-                                    record=record,
-                                    config=config,
+                        while not self._stop_event.is_set():
+                            sample_no += 1
+                            if config.measurement_mode == "remote_ssh":
+                                record = self._run_remote_iteration(
+                                    writer, csv_file, neighbor_writer, config, sample_no
                                 )
-                        else:
-                            with self._network_switch_lock:
-                                self._run_local_iteration(
-                                    writer, csv_file, neighbor_writer, config, target_ip, sample_no
+                                if record and advanced_file and config.remote_advanced_enabled:
+                                    self._maybe_capture_remote_advanced_snapshot(
+                                        advanced_file=advanced_file,
+                                        record=record,
+                                        config=config,
+                                    )
+                            else:
+                                target_ip = (
+                                    self._ping_target_info[0]
+                                    if self._ping_target_info and self._ping_target_info[0]
+                                    else target_ip
                                 )
-                        time.sleep(config.interval)
-                finally:
-                    if advanced_file is not None:
-                        advanced_file.close()
+                                if self._local_reconnect_running():
+                                    self._write_local_disconnected_record(
+                                        writer, csv_file, config, target_ip, "wifi_reconnect_in_progress"
+                                    )
+                                elif self._network_switch_lock.acquire(blocking=False):
+                                    try:
+                                        self._run_local_iteration(
+                                            writer, csv_file, neighbor_writer, config, target_ip, sample_no
+                                        )
+                                    finally:
+                                        self._network_switch_lock.release()
+                                else:
+                                    self._write_local_disconnected_record(
+                                        writer, csv_file, config, target_ip, "network_switch_in_progress"
+                                    )
+                            time.sleep(config.interval)
+                    finally:
+                        if advanced_file is not None:
+                            advanced_file.close()
         except Exception as exc:  # noqa: BLE001
             self._last_error = str(exc)
         finally:
@@ -916,6 +1024,8 @@ class MeasurementService:
                 row.get("ssh_status", ""),
                 row.get("error", ""),
             ]
+            iw_info = self._prepare_iw_info(row, row.get("bssid", ""))
+            self._append_iw_columns(log_line, iw_info)
             message = str(row.get("error", "") or error_message)
         else:
             log_line = [
@@ -952,6 +1062,8 @@ class MeasurementService:
                 "error",
                 error_message or "remote_capture_failed",
             ]
+            self._last_iw_counters = None
+            self._append_iw_columns(log_line, {})
             message = error_message or "remote_capture_failed"
 
         return self._write_and_publish_record(writer, csv_file, log_line, message, config.retain_rows)
@@ -965,7 +1077,6 @@ class MeasurementService:
         target_ip: str,
         sample_no: int,
     ) -> None:
-        self._ensure_local_wifi_connected(config)
         try:
             wifi_rows = fetch_wifi_rows(
                 config.use_sudo,
@@ -980,9 +1091,13 @@ class MeasurementService:
 
         date_str, time_str, point_value = self._timestamp_and_point()
 
-        if config.remote_enable_neighbor_scan and should_run_neighbor_scan(sample_no, config.remote_neighbor_every):
-            try:
-                neighbor_rows = scan_local_neighbors(config.use_sudo, config.remote_neighbor_ssid)
+        neighbor_result = self._take_neighbor_scan_result()
+        if neighbor_result:
+            neighbor_rows = neighbor_result.get("rows", [])
+            scan_error = str(neighbor_result.get("error", "") or "")
+            if scan_error:
+                error_message = error_message or scan_error
+            else:
                 for row in wifi_rows:
                     apply_neighbor_summary(row, neighbor_rows, config.remote_neighbor_ssid)
                 self._write_neighbor_rows(
@@ -993,8 +1108,12 @@ class MeasurementService:
                     time_str,
                     "local",
                 )
-            except RuntimeError as exc:
-                error_message = error_message or str(exc)
+
+        if (
+            config.remote_enable_neighbor_scan
+            and should_run_neighbor_scan(sample_no, config.remote_neighbor_every)
+        ):
+            self._schedule_neighbor_scan(config.use_sudo, config.remote_neighbor_ssid)
 
         if wifi_rows:
             for row in wifi_rows:
@@ -1004,6 +1123,9 @@ class MeasurementService:
                     config.ping_fail_value,
                     config.ping_timeout_ms,
                 )
+                iw_info = fetch_local_iw_station_info()
+                iw_info["IwTxPowerDbm"] = fetch_local_iw_tx_power()
+                iw_info = self._prepare_iw_info(iw_info, row.get("bssid", ""))
                 log_line = [
                     self._log_index,
                     point_value,
@@ -1038,56 +1160,159 @@ class MeasurementService:
                     "",
                     "",
                 ]
+                self._append_iw_columns(log_line, iw_info)
                 self._write_and_publish_record(writer, csv_file, log_line, error_message, config.retain_rows)
         else:
-            icmp_seq, ttl, time_ms, _ping_status = get_ping_result(
-                target_ip,
-                config.timeout_as_numeric,
-                config.ping_fail_value,
-                config.ping_timeout_ms,
+            self._schedule_local_wifi_reconnect(config)
+            self._write_local_disconnected_record(
+                writer, csv_file, config, target_ip, error_message or "wifi_disconnected"
             )
-            placeholder_time = str(config.wifi_disconnected_value) if config.timeout_as_numeric else "NaN"
-            log_line = [
-                self._log_index,
-                point_value,
-                date_str,
-                time_str,
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                icmp_seq,
-                ttl,
-                placeholder_time,
-                "wifi_disconnected",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                target_ip,
-                self._ping_target_info[1] if self._ping_target_info else "",
-                "local",
-                "",
-                error_message or "wifi_disconnected",
-            ]
-            self._write_and_publish_record(
-                writer,
-                csv_file,
-                log_line,
-                error_message or "Wi-Fi disconnected placeholder recorded",
-                config.retain_rows,
+
+    def _schedule_neighbor_scan(self, use_sudo: bool, target_ssid: Optional[str]) -> None:
+        with self._neighbor_scan_lock:
+            if self._neighbor_scan_thread and self._neighbor_scan_thread.is_alive():
+                return
+            if self._pending_neighbor_result is not None:
+                return
+            generation = self._neighbor_scan_generation
+            self._neighbor_scan_thread = threading.Thread(
+                target=self._neighbor_scan_worker,
+                args=(use_sudo, target_ssid, generation),
+                daemon=True,
+                name="wifi-neighbor-scan",
             )
+            self._neighbor_scan_thread.start()
+
+    def _neighbor_scan_worker(
+        self,
+        use_sudo: bool,
+        target_ssid: Optional[str],
+        generation: int,
+    ) -> None:
+        try:
+            result: Dict[str, Any] = {
+                "rows": scan_local_neighbors(use_sudo, target_ssid),
+                "error": "",
+            }
+        except RuntimeError as exc:
+            result = {"rows": [], "error": str(exc)}
+        with self._neighbor_scan_lock:
+            if generation == self._neighbor_scan_generation:
+                self._pending_neighbor_result = result
+
+    def _take_neighbor_scan_result(self) -> Optional[Dict[str, Any]]:
+        with self._neighbor_scan_lock:
+            result = self._pending_neighbor_result
+            self._pending_neighbor_result = None
+            return result
+
+    def _write_local_disconnected_record(
+        self,
+        writer: csv.writer,
+        csv_file,
+        config: MeasurementConfig,
+        target_ip: str,
+        error_message: str,
+    ) -> None:
+        date_str, time_str, point_value = self._timestamp_and_point()
+        placeholder_time = str(config.wifi_disconnected_value) if config.timeout_as_numeric else "NaN"
+        log_line = [
+            self._log_index,
+            point_value,
+            date_str,
+            time_str,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            placeholder_time,
+            "wifi_disconnected",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            target_ip,
+            self._ping_target_info[1] if self._ping_target_info else "",
+            "local",
+            "",
+            error_message,
+        ]
+        self._last_iw_counters = None
+        self._append_iw_columns(log_line, {})
+        self._write_and_publish_record(
+            writer,
+            csv_file,
+            log_line,
+            "Wi-Fi disconnected placeholder recorded",
+            config.retain_rows,
+        )
+
+    @staticmethod
+    def _normalize_bssid(value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    @staticmethod
+    def _counter_value(info: Dict[str, Any], key: str) -> Optional[int]:
+        try:
+            return int(str(info.get(key, "")).strip())
+        except (TypeError, ValueError):
+            return None
+
+    def _prepare_iw_info(self, info: Dict[str, Any], expected_bssid: Any) -> Dict[str, Any]:
+        prepared = {header: str(info.get(header, "") or "") for header in IW_HEADERS}
+        if prepared["IwSampleValid"] != "yes":
+            self._last_iw_counters = None
+            return prepared
+
+        expected = self._normalize_bssid(expected_bssid)
+        station = self._normalize_bssid(prepared["IwStationBssid"])
+        if not expected or expected != station:
+            prepared = {header: "" for header in IW_HEADERS}
+            self._last_iw_counters = None
+            return prepared
+
+        current = {
+            "bssid": station,
+            "tx_packets": self._counter_value(prepared, "IwTxPacketsTotal"),
+            "tx_retries": self._counter_value(prepared, "IwTxRetriesTotal"),
+            "tx_failed": self._counter_value(prepared, "IwTxFailedTotal"),
+        }
+        previous = self._last_iw_counters
+        if previous and previous.get("bssid") == station:
+            deltas: Dict[str, int] = {}
+            for name in ("tx_packets", "tx_retries", "tx_failed"):
+                old_value = previous.get(name)
+                new_value = current.get(name)
+                if old_value is None or new_value is None or new_value < old_value:
+                    deltas = {}
+                    break
+                deltas[name] = new_value - old_value
+            if deltas:
+                prepared["IwTxPacketsDelta"] = str(deltas["tx_packets"])
+                prepared["IwTxRetriesDelta"] = str(deltas["tx_retries"])
+                prepared["IwTxFailedDelta"] = str(deltas["tx_failed"])
+                if deltas["tx_packets"] > 0:
+                    prepared["IwTxRetryRatePct"] = f'{deltas["tx_retries"] / deltas["tx_packets"] * 100:.3f}'
+                    prepared["IwTxFailedRatePct"] = f'{deltas["tx_failed"] / deltas["tx_packets"] * 100:.3f}'
+        self._last_iw_counters = current
+        return prepared
+
+    @staticmethod
+    def _append_iw_columns(log_line: List[Any], info: Dict[str, Any]) -> None:
+        log_line.extend(info.get(header, "") for header in IW_HEADERS)
 
     @staticmethod
     def _format_dbm(value: Any) -> str:

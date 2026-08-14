@@ -18,7 +18,7 @@ fi
 
 echo "Installing system packages..."
 sudo apt-get update
-sudo apt-get install -y python3 python3-venv python3-pip network-manager iputils-ping
+sudo apt-get install -y python3 python3-venv python3-pip network-manager iputils-ping iw
 
 echo "Creating Python virtual environment..."
 python3 -m venv "$VENV_DIR"

@@ -1,14 +1,17 @@
 ﻿from __future__ import annotations
 
+import base64
 import csv
 import datetime as dt
 import io
+import json
 import math
 import os
 import platform
 import re
 import shlex
 import subprocess
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -20,7 +23,7 @@ CHANNEL_FILTER: Dict[str, Dict[str, int]] = {
     "6GHz": {"min": 166, "max": 233},
 }
 
-HEADERS = [
+LEGACY_HEADERS = [
     "Index",
     "Point",
     "Date",
@@ -54,6 +57,37 @@ HEADERS = [
     "SshStatus",
     "Error",
 ]
+
+IW_HEADERS = [
+    "IwSampleValid",
+    "IwStationBssid",
+    "IwSignalDbm",
+    "IwSignalAvgDbm",
+    "IwBeaconSignalAvgDbm",
+    "IwChainSignalDbm",
+    "IwTxPacketsTotal",
+    "IwTxRetriesTotal",
+    "IwTxFailedTotal",
+    "IwTxPacketsDelta",
+    "IwTxRetriesDelta",
+    "IwTxFailedDelta",
+    "IwTxRetryRatePct",
+    "IwTxFailedRatePct",
+    "IwTxBitrate",
+    "IwRxBitrate",
+    "IwTxMcs",
+    "IwTxNss",
+    "IwRxMcs",
+    "IwRxNss",
+    "IwChannelWidthMhz",
+    "IwTxPowerDbm",
+    "IwInactiveTimeMs",
+    "IwBeaconLoss",
+    "IwRxDropMisc",
+]
+
+HEADERS = LEGACY_HEADERS + IW_HEADERS
+IW_COMMAND_TIMEOUT_SEC = 0.5
 
 NEIGHBOR_HEADERS = [
     "Index",
@@ -98,7 +132,16 @@ DEFAULT_INTERVAL = 1.0
 DEFAULT_PING_FAIL_VALUE = 999.0
 DEFAULT_PING_TIMEOUT_MS = 2000
 DEFAULT_WIFI_DISCONNECTED_VALUE = 999.0
-DEFAULT_WIFI_RECONNECT_COOLDOWN_SEC = 15
+DEFAULT_WIFI_RECONNECT_COOLDOWN_SEC = 5
+FIXED_BSSID_RECONNECT_WAIT_SEC = 15
+FIXED_BSSID_SCAN_SETTLE_SEC = 3.0
+FIXED_BSSID_SCAN_POLL_SEC = 0.5
+TRANSIENT_WIFI_SCAN_ERRORS = (
+    "already scanning",
+    "immediately following previous scan",
+    "while unavailable or activating",
+)
+SSID_LOCK_STATE_PATH = Path(__file__).resolve().parent.parent / "logs" / "ssid_lock_state.json"
 DEFAULT_USE_SUDO = not IS_WINDOWS
 DEFAULT_REMOTE_USER = "nvidia"
 DEFAULT_REMOTE_PORT = 22
@@ -106,7 +149,7 @@ DEFAULT_REMOTE_NEIGHBOR_EVERY = 5
 DEFAULT_REMOTE_SSH_TIMEOUT_SEC = 5
 
 
-def _base_remote(port: int, identity_file: str | None) -> List[str]:
+def _base_remote(port: int, identity_file: Optional[str]) -> List[str]:
     cmd = [
         "-p",
         str(port),
@@ -130,7 +173,7 @@ def _default_identity_file() -> Path:
     return Path.home() / ".ssh" / "id_ed25519"
 
 
-def _build_wifi_probe_script(ping_target: str | None) -> str:
+def _build_wifi_probe_script(ping_target: Optional[str]) -> str:
     target_expr = (
         shlex.quote(ping_target)
         if ping_target
@@ -162,15 +205,19 @@ if [ -n "$TARGET" ]; then
     PING_STATUS="timeout"
   fi
 fi
+IW_STATION_B64="$(iw dev wlan0 station dump 2>/dev/null | base64 | tr -d '\\n')"
+IW_TX_POWER="$(iw dev wlan0 info 2>/dev/null | sed -n 's/^[[:space:]]*txpower[[:space:]]\\+\\([-0-9.]*\\)[[:space:]]\\+dBm.*/\\1/p' | head -n 1)"
 printf 'WIFI=%s\\n' "$WIFI_LINE"
 printf 'PING_TARGET=%s\\n' "$TARGET"
 printf 'PING_MS=%s\\n' "$PING_MS"
 printf 'PING_STATUS=%s\\n' "$PING_STATUS"
 printf 'ARP_TARGET_STATE=%s\\n' "$ARP_STATE"
+printf 'IW_STATION_B64=%s\\n' "$IW_STATION_B64"
+printf 'IW_TX_POWER=%s\\n' "$IW_TX_POWER"
 """.strip()
 
 
-def _build_neighbor_scan_script(target_ssid: str | None) -> str:
+def _build_neighbor_scan_script(target_ssid: Optional[str]) -> str:
     ssid_filter = shlex.quote(target_ssid or "")
     return f"""
 TARGET_SSID={ssid_filter}
@@ -426,6 +473,9 @@ def build_nmcli_command(use_sudo: bool) -> List[str]:
         "ACTIVE,SSID,BSSID,CHAN,RATE,SIGNAL",
         "dev",
         "wifi",
+        "list",
+        "--rescan",
+        "no",
     ]
     if use_sudo:
         cmd.insert(0, "sudo")
@@ -703,7 +753,17 @@ def scan_local_neighbors(use_sudo: bool, target_ssid: Optional[str]) -> List[Dic
             raise RuntimeError("netsh neighbor scan failed") from exc
         return _parse_netsh_neighbor_rows(result.stdout or "", target_ssid)
 
-    cmd = ["nmcli", "-t", "-f", "SSID,BSSID,CHAN,RATE,SIGNAL", "dev", "wifi", "list"]
+    cmd = [
+        "nmcli",
+        "-t",
+        "-f",
+        "SSID,BSSID,CHAN,RATE,SIGNAL",
+        "dev",
+        "wifi",
+        "list",
+        "--rescan",
+        "yes",
+    ]
     if use_sudo:
         cmd.insert(0, "sudo")
     try:
@@ -711,7 +771,15 @@ def scan_local_neighbors(use_sudo: bool, target_ssid: Optional[str]) -> List[Dic
     except FileNotFoundError as exc:
         raise RuntimeError("nmcli command was not found") from exc
     except subprocess.CalledProcessError as exc:
-        raise RuntimeError(exc.stderr.strip() or "nmcli neighbor scan failed") from exc
+        detail = (exc.stderr or exc.stdout or "").strip()
+        if not any(message in detail.lower() for message in TRANSIENT_WIFI_SCAN_ERRORS):
+            raise RuntimeError(detail or "nmcli neighbor scan failed") from exc
+        fallback_cmd = [*cmd[:-1], "no"]
+        try:
+            result = subprocess.run(fallback_cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as fallback_exc:
+            fallback_detail = (fallback_exc.stderr or fallback_exc.stdout or "").strip()
+            raise RuntimeError(fallback_detail or "nmcli neighbor scan failed") from fallback_exc
     neighbors = [_parse_neighbor_line(line) for line in result.stdout.splitlines()]
     return [
         row
@@ -741,12 +809,195 @@ def _run_local_nmcli(use_sudo: bool, args: List[str], timeout: int = 35) -> str:
     return result.stdout
 
 
+def _get_local_wifi_device(use_sudo: bool) -> str:
+    output = _run_local_nmcli(use_sudo, ["-t", "-f", "DEVICE,TYPE", "device", "status"])
+    for line in output.splitlines():
+        fields = next(csv.reader([line], delimiter=":", escapechar="\\"), [])
+        if len(fields) >= 2 and fields[1].strip() == "wifi":
+            return fields[0].strip()
+    raise RuntimeError("No Wi-Fi device was found")
+
+
+def _get_saved_profile_bssid(use_sudo: bool, connection: str) -> str:
+    try:
+        output = _run_local_nmcli(
+            use_sudo,
+            ["-g", "802-11-wireless.bssid", "connection", "show", "id", connection],
+        )
+    except RuntimeError:
+        return ""
+    return output.strip().lower().replace("\\:", ":")
+
+
+def empty_iw_station_info() -> Dict[str, str]:
+    return {header: "" for header in IW_HEADERS}
+
+
+def parse_iw_station_dump(output: str) -> Dict[str, str]:
+    info = empty_iw_station_info()
+    station_match = re.search(r"^Station\s+([0-9a-f:]{17})\s+", output, re.IGNORECASE | re.MULTILINE)
+    if not station_match:
+        return info
+
+    info["IwSampleValid"] = "yes"
+    info["IwStationBssid"] = station_match.group(1).upper()
+    patterns = {
+        "IwInactiveTimeMs": r"^\s*inactive time:\s*(\d+)\s*ms",
+        "IwTxPacketsTotal": r"^\s*tx packets:\s*(\d+)",
+        "IwTxRetriesTotal": r"^\s*tx retries:\s*(\d+)",
+        "IwTxFailedTotal": r"^\s*tx failed:\s*(\d+)",
+        "IwBeaconLoss": r"^\s*beacon loss:\s*(\d+)",
+        "IwRxDropMisc": r"^\s*rx drop misc:\s*(\d+)",
+        "IwSignalDbm": r"^\s*signal:\s*(-?\d+)\s+(?:\[[^\]]*\]\s+)?dBm",
+        "IwSignalAvgDbm": r"^\s*signal avg:\s*(-?\d+)\s+dBm",
+        "IwBeaconSignalAvgDbm": r"^\s*beacon signal avg:\s*(-?\d+)\s+dBm",
+    }
+    for key, pattern in patterns.items():
+        match = re.search(pattern, output, re.IGNORECASE | re.MULTILINE)
+        if match:
+            info[key] = match.group(1)
+
+    signal_line = re.search(
+        r"^\s*signal:\s*-?\d+\s+\[([^\]]+)\]\s+dBm",
+        output,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if signal_line:
+        chains = re.findall(r"-?\d+", signal_line.group(1))
+        info["IwChainSignalDbm"] = "|".join(chains)
+
+    for direction, prefix in (("tx", "IwTx"), ("rx", "IwRx")):
+        match = re.search(rf"^\s*{direction} bitrate:\s*(.+)$", output, re.IGNORECASE | re.MULTILINE)
+        if not match:
+            continue
+        bitrate = match.group(1).strip()
+        info[f"{prefix}Bitrate"] = bitrate
+        mcs_match = re.search(r"(?:HE-|VHT-|EHT-)?MCS\s*(\d+)", bitrate, re.IGNORECASE)
+        nss_match = re.search(r"(?:HE-|VHT-|EHT-)?NSS\s*(\d+)", bitrate, re.IGNORECASE)
+        width_match = re.search(r"(\d+)MHz", bitrate, re.IGNORECASE)
+        if mcs_match:
+            info[f"{prefix}Mcs"] = mcs_match.group(1)
+        if nss_match:
+            info[f"{prefix}Nss"] = nss_match.group(1)
+        if width_match and not info["IwChannelWidthMhz"]:
+            info["IwChannelWidthMhz"] = width_match.group(1)
+    return info
+
+
+def fetch_local_iw_station_info(interface: str = "wlan0") -> Dict[str, str]:
+    if IS_WINDOWS:
+        return empty_iw_station_info()
+    try:
+        result = subprocess.run(
+            ["iw", "dev", interface, "station", "dump"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=IW_COMMAND_TIMEOUT_SEC,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return empty_iw_station_info()
+    if result.returncode != 0:
+        return empty_iw_station_info()
+    return parse_iw_station_dump(result.stdout or "")
+
+
+def fetch_local_iw_tx_power(interface: str = "wlan0") -> str:
+    if IS_WINDOWS:
+        return ""
+    try:
+        result = subprocess.run(
+            ["iw", "dev", interface, "info"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=IW_COMMAND_TIMEOUT_SEC,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    match = re.search(r"^\s*txpower\s+(-?\d+(?:\.\d+)?)\s+dBm", result.stdout or "", re.MULTILINE)
+    return match.group(1) if match else ""
+
+
+def _fixed_bssid_is_visible(use_sudo: bool, device: str, bssid: str) -> bool:
+    # Called only while disconnected from the measurement target.
+    try:
+        _run_local_nmcli(use_sudo, ["device", "wifi", "rescan", "ifname", device], timeout=10)
+    except RuntimeError as exc:
+        detail = str(exc).lower()
+        if not any(message in detail for message in TRANSIENT_WIFI_SCAN_ERRORS):
+            raise
+
+    # The rescan command returns before NetworkManager necessarily publishes
+    # fresh results. Poll the cache briefly so a BSSID that has just come back
+    # into range is not rejected based on the previous scan.
+    deadline = time.monotonic() + FIXED_BSSID_SCAN_SETTLE_SEC
+    while True:
+        output = _run_local_nmcli(
+            use_sudo,
+            [
+                "-t",
+                "-f",
+                "SSID,BSSID,CHAN,RATE,SIGNAL",
+                "device",
+                "wifi",
+                "list",
+                "ifname",
+                device,
+                "--rescan",
+                "no",
+            ],
+            timeout=10,
+        )
+        if any(
+            _parse_neighbor_line(line).get("bssid", "").lower() == bssid
+            for line in output.splitlines()
+        ):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(FIXED_BSSID_SCAN_POLL_SEC, remaining))
+
+
 def switch_local_wifi_ssid(use_sudo: bool, ssid: str, password: Optional[str] = None) -> Dict[str, object]:
     if IS_WINDOWS:
         raise RuntimeError("AP switching is supported on Jetson/Linux only")
     normalized_ssid = ssid.strip()
     if not normalized_ssid:
         raise RuntimeError("SSID is required")
+
+    current = get_current_local_wifi_state(use_sudo)
+    if str(current.get("ssid", "")).strip() == normalized_ssid:
+        return current
+
+    # SSID-only operations must not inherit a BSSID constraint from another
+    # saved profile for the same SSID.
+    if not password:
+        for profile in _list_saved_wifi_profiles(use_sudo):
+            profile_ssid = _get_wifi_profile_ssid(use_sudo, profile["uuid"]).strip()
+            profile_bssid = _run_local_nmcli(
+                use_sudo,
+                ["-g", "802-11-wireless.bssid", "connection", "show", "uuid", profile["uuid"]],
+            ).strip()
+            if profile_ssid != normalized_ssid or profile_bssid:
+                continue
+            try:
+                _run_local_nmcli(
+                    use_sudo,
+                    ["--wait", "30", "connection", "up", "uuid", profile["uuid"]],
+                )
+            except RuntimeError:
+                continue
+            connected = get_current_local_wifi_state(use_sudo)
+            if str(connected.get("ssid", "")).strip() == normalized_ssid:
+                return connected
 
     args = ["--wait", "30", "device", "wifi", "connect", normalized_ssid]
     if password:
@@ -764,6 +1015,46 @@ def reconnect_local_wifi(use_sudo: bool, ssid: str) -> Dict[str, object]:
     normalized_ssid = ssid.strip()
     if not normalized_ssid:
         raise RuntimeError("SSID is required")
+
+    fixed_bssid = _get_saved_profile_bssid(use_sudo, normalized_ssid)
+    try:
+        current = get_current_local_wifi_state(use_sudo)
+    except RuntimeError:
+        current = {}
+    current_ssid = str(current.get("ssid", "")).strip()
+    current_bssid = str(current.get("bssid", "")).strip().lower()
+    if current_ssid == normalized_ssid and (not fixed_bssid or current_bssid == fixed_bssid):
+        return current
+
+    if fixed_bssid:
+        wifi_device = _get_local_wifi_device(use_sudo)
+        if not _fixed_bssid_is_visible(use_sudo, wifi_device, fixed_bssid):
+            raise RuntimeError(f"Fixed BSSID is not visible: {fixed_bssid}")
+        _run_local_nmcli(
+            use_sudo,
+            [
+                "--wait",
+                str(FIXED_BSSID_RECONNECT_WAIT_SEC),
+                "connection",
+                "up",
+                "id",
+                normalized_ssid,
+                "ifname",
+                wifi_device,
+            ],
+            timeout=FIXED_BSSID_RECONNECT_WAIT_SEC + 5,
+        )
+        connected = get_current_local_wifi_state(use_sudo)
+        actual_bssid = str(connected.get("bssid", "")).strip().lower()
+        if (
+            str(connected.get("ssid", "")).strip() != normalized_ssid
+            or actual_bssid != fixed_bssid
+        ):
+            raise RuntimeError(
+                f"Fixed BSSID reconnect verification failed: {actual_bssid or 'not connected'}"
+            )
+        return connected
+
     try:
         _run_local_nmcli(use_sudo, ["--wait", "30", "connection", "up", "id", normalized_ssid])
     except RuntimeError:
@@ -784,14 +1075,46 @@ def switch_local_wifi_bssid(use_sudo: bool, ssid: str, bssid: str) -> Dict[str, 
     if not re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", normalized_bssid):
         raise RuntimeError("Invalid BSSID format")
 
-    _run_local_nmcli(
-        use_sudo,
-        ["--wait", "30", "device", "wifi", "connect", normalized_ssid, "bssid", normalized_bssid],
-    )
+    current = get_current_local_wifi_state(use_sudo)
+    if str(current.get("ssid", "")).strip() == normalized_ssid:
+        lock_info = get_local_wifi_bssid_lock(use_sudo)
+        connection = lock_info["connection"]
+        previous_bssid = lock_info["bssid"]
+        _run_local_nmcli(
+            use_sudo,
+            ["connection", "modify", "id", connection, "802-11-wireless.bssid", normalized_bssid],
+        )
+        try:
+            try:
+                _run_local_nmcli(use_sudo, ["connection", "down", "id", connection])
+            except RuntimeError:
+                pass
+            _run_local_nmcli(
+                use_sudo,
+                ["--wait", "30", "connection", "up", "id", connection],
+            )
+        except Exception:
+            _run_local_nmcli(
+                use_sudo,
+                ["connection", "modify", "id", connection, "802-11-wireless.bssid", previous_bssid],
+            )
+            _run_local_nmcli(use_sudo, ["--wait", "30", "connection", "up", "id", connection])
+            raise
+    else:
+        _run_local_nmcli(
+            use_sudo,
+            ["--wait", "30", "device", "wifi", "connect", normalized_ssid, "bssid", normalized_bssid],
+        )
 
     connected = get_current_local_wifi_state(use_sudo)
     actual_bssid = str(connected.get("bssid", "")).lower()
     if actual_bssid != normalized_bssid:
+        if str(current.get("ssid", "")).strip() == normalized_ssid:
+            _run_local_nmcli(
+                use_sudo,
+                ["connection", "modify", "id", connection, "802-11-wireless.bssid", previous_bssid],
+            )
+            _run_local_nmcli(use_sudo, ["--wait", "30", "connection", "up", "id", connection])
         raise RuntimeError(f"Connected BSSID verification failed: {actual_bssid or 'not connected'}")
     return connected
 
@@ -815,7 +1138,7 @@ def get_local_wifi_bssid_lock(use_sudo: bool) -> Dict[str, str]:
     locked_bssid = _run_local_nmcli(
         use_sudo,
         ["-g", "802-11-wireless.bssid", "connection", "show", "id", connection],
-    ).strip().lower()
+    ).strip().lower().replace("\\:", ":")
     return {"connection": connection, "bssid": locked_bssid}
 
 
@@ -836,57 +1159,214 @@ def set_local_wifi_bssid_lock(use_sudo: bool, bssid: Optional[str]) -> Dict[str,
     return updated_lock
 
 
-def get_local_wifi_ap_lock(use_sudo: bool) -> Dict[str, str]:
-    if IS_WINDOWS:
-        raise RuntimeError("AP locking is supported on Jetson/Linux only")
-    connection_info = get_local_wifi_bssid_lock(use_sudo)
-    values = _run_local_nmcli(
+def _list_saved_wifi_profiles(use_sudo: bool) -> List[Dict[str, str]]:
+    output = _run_local_nmcli(
         use_sudo,
         [
-            "-g",
-            "802-11-wireless.ssid,connection.autoconnect,connection.autoconnect-priority",
+            "-t",
+            "-f",
+            "NAME,UUID,TYPE,AUTOCONNECT,AUTOCONNECT-PRIORITY",
             "connection",
             "show",
-            "id",
-            connection_info["connection"],
         ],
-    ).splitlines()
-    ssid = values[0].strip() if len(values) > 0 else ""
-    autoconnect = values[1].strip().lower() if len(values) > 1 else ""
-    priority = values[2].strip() if len(values) > 2 else "0"
+    )
+    profiles: List[Dict[str, str]] = []
+    for line in output.splitlines():
+        fields = next(csv.reader([line], delimiter=":", escapechar="\\"), [])
+        if len(fields) < 5 or fields[2].strip() != "802-11-wireless":
+            continue
+        profiles.append(
+            {
+                "connection": fields[0].strip(),
+                "uuid": fields[1].strip(),
+                "autoconnect": fields[3].strip().lower(),
+                "priority": fields[4].strip() or "0",
+            }
+        )
+    return profiles
+
+
+def _read_ssid_lock_snapshot() -> Optional[Dict[str, object]]:
+    if not SSID_LOCK_STATE_PATH.exists():
+        return None
     try:
-        priority_value = int(priority or "0")
-    except ValueError:
-        priority_value = 0
+        data = json.loads(SSID_LOCK_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("SSID lock state file is invalid") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("profiles"), list):
+        raise RuntimeError("SSID lock state file is invalid")
+    return data
+
+
+def _write_ssid_lock_snapshot(snapshot: Dict[str, object]) -> None:
+    SSID_LOCK_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = SSID_LOCK_STATE_PATH.with_suffix(".tmp")
+    temporary_path.write_text(
+        json.dumps(snapshot, ensure_ascii=True, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    temporary_path.replace(SSID_LOCK_STATE_PATH)
+
+
+def _get_wifi_profile_ssid(use_sudo: bool, profile_uuid: str) -> str:
+    return _run_local_nmcli(
+        use_sudo,
+        ["-g", "802-11-wireless.ssid", "connection", "show", "uuid", profile_uuid],
+    ).strip()
+
+
+def list_saved_local_wifi_profiles(use_sudo: bool) -> List[Dict[str, str]]:
+    if IS_WINDOWS:
+        return []
+    saved_profiles: List[Dict[str, str]] = []
+    for profile in _list_saved_wifi_profiles(use_sudo):
+        ssid = _get_wifi_profile_ssid(use_sudo, profile["uuid"]).strip()
+        bssid = _run_local_nmcli(
+            use_sudo,
+            ["-g", "802-11-wireless.bssid", "connection", "show", "uuid", profile["uuid"]],
+        ).strip().lower().replace("\\:", ":")
+        if ssid:
+            saved_profiles.append(
+                {
+                    "connection": profile["connection"],
+                    "ssid": ssid,
+                    "bssid": bssid,
+                }
+            )
+    return saved_profiles
+
+
+def _get_active_wifi_profile_uuid(use_sudo: bool) -> str:
+    output = _run_local_nmcli(
+        use_sudo,
+        ["-t", "-f", "UUID,TYPE,DEVICE", "connection", "show", "--active"],
+    )
+    for line in output.splitlines():
+        fields = next(csv.reader([line], delimiter=":", escapechar="\\"), [])
+        if len(fields) >= 3 and fields[1].strip() == "802-11-wireless" and fields[2].strip():
+            return fields[0].strip()
+    return ""
+
+
+def get_local_wifi_ap_lock(use_sudo: bool) -> Dict[str, str]:
+    if IS_WINDOWS:
+        raise RuntimeError("SSID locking is supported on Jetson/Linux only")
+    snapshot = _read_ssid_lock_snapshot()
+    if not snapshot:
+        return {
+            "connection": "",
+            "ssid": "",
+            "priority": "0",
+            "locked": "no",
+            "disabled_count": "0",
+        }
+
+    target_uuid = str(snapshot.get("target_uuid", ""))
+    current_profiles = _list_saved_wifi_profiles(use_sudo)
+    target = next((profile for profile in current_profiles if profile["uuid"] == target_uuid), None)
+    other_profiles = [profile for profile in current_profiles if profile["uuid"] != target_uuid]
+    locked = bool(
+        target
+        and target["autoconnect"] == "yes"
+        and all(profile["autoconnect"] == "no" for profile in other_profiles)
+    )
     return {
-        "connection": connection_info["connection"],
-        "ssid": ssid,
-        "priority": str(priority_value),
-        "locked": "yes" if autoconnect == "yes" and priority_value >= 100 else "no",
+        "connection": str(snapshot.get("target_connection", "")),
+        "ssid": str(snapshot.get("target_ssid", "")),
+        "priority": target["priority"] if target else "0",
+        "locked": "yes" if locked else "no",
+        "disabled_count": str(sum(profile["autoconnect"] == "no" for profile in other_profiles)),
     }
 
 
-def set_local_wifi_ap_lock(use_sudo: bool, locked: bool) -> Dict[str, str]:
+def _restore_local_wifi_autoconnect(use_sudo: bool) -> Dict[str, str]:
+    snapshot = _read_ssid_lock_snapshot()
+    if not snapshot:
+        return get_local_wifi_ap_lock(use_sudo)
+    profiles = snapshot.get("profiles", [])
+    for profile in profiles:
+        if not isinstance(profile, dict) or not profile.get("uuid"):
+            continue
+        _run_local_nmcli(
+            use_sudo,
+            [
+                "connection",
+                "modify",
+                "uuid",
+                str(profile["uuid"]),
+                "connection.autoconnect",
+                str(profile.get("autoconnect", "yes")),
+                "connection.autoconnect-priority",
+                str(profile.get("priority", "0")),
+            ],
+        )
+    SSID_LOCK_STATE_PATH.unlink(missing_ok=True)
+    return get_local_wifi_ap_lock(use_sudo)
+
+
+def set_local_wifi_ap_lock(
+    use_sudo: bool,
+    locked: bool,
+    connection: Optional[str] = None,
+) -> Dict[str, str]:
     if IS_WINDOWS:
-        raise RuntimeError("AP locking is supported on Jetson/Linux only")
-    current_lock = get_local_wifi_ap_lock(use_sudo)
-    _run_local_nmcli(
-        use_sudo,
-        [
-            "connection",
-            "modify",
-            "id",
-            current_lock["connection"],
-            "connection.autoconnect",
-            "yes",
-            "connection.autoconnect-priority",
-            "100" if locked else "0",
-        ],
-    )
-    updated_lock = get_local_wifi_ap_lock(use_sudo)
-    if (updated_lock["locked"] == "yes") != locked:
-        raise RuntimeError("AP lock verification failed")
-    return updated_lock
+        raise RuntimeError("SSID locking is supported on Jetson/Linux only")
+    if not locked:
+        return _restore_local_wifi_autoconnect(use_sudo)
+
+    normalized_connection = (connection or "").strip()
+    if not normalized_connection:
+        normalized_connection = get_local_wifi_bssid_lock(use_sudo)["connection"]
+
+    existing_snapshot = _read_ssid_lock_snapshot()
+    if existing_snapshot:
+        if str(existing_snapshot.get("target_connection", "")) == normalized_connection:
+            current_lock = get_local_wifi_ap_lock(use_sudo)
+            if current_lock["locked"] == "yes":
+                return current_lock
+        _restore_local_wifi_autoconnect(use_sudo)
+
+    profiles = _list_saved_wifi_profiles(use_sudo)
+    target = next((profile for profile in profiles if profile["connection"] == normalized_connection), None)
+    if not target:
+        raise RuntimeError(f"No saved Wi-Fi profile was found: {normalized_connection}")
+    target_ssid = _get_wifi_profile_ssid(use_sudo, target["uuid"])
+    snapshot: Dict[str, object] = {
+        "target_connection": target["connection"],
+        "target_ssid": target_ssid,
+        "target_uuid": target["uuid"],
+        "profiles": profiles,
+    }
+    _write_ssid_lock_snapshot(snapshot)
+
+    try:
+        for profile in profiles:
+            args = [
+                "connection",
+                "modify",
+                "uuid",
+                profile["uuid"],
+                "connection.autoconnect",
+                "yes" if profile["uuid"] == target["uuid"] else "no",
+            ]
+            if profile["uuid"] == target["uuid"]:
+                args.extend(["connection.autoconnect-priority", "100"])
+            _run_local_nmcli(use_sudo, args)
+
+        active_uuid = _get_active_wifi_profile_uuid(use_sudo)
+        if active_uuid and active_uuid != target["uuid"]:
+            _run_local_nmcli(use_sudo, ["connection", "down", "uuid", active_uuid])
+
+        updated_lock = get_local_wifi_ap_lock(use_sudo)
+        if updated_lock["locked"] != "yes":
+            raise RuntimeError("SSID lock verification failed")
+        return updated_lock
+    except Exception:
+        try:
+            _restore_local_wifi_autoconnect(use_sudo)
+        except Exception:
+            pass
+        raise
 
 
 def get_ping_result(
@@ -1206,6 +1686,7 @@ def fetch_remote_wifi_state(
             "error": "remote_probe_timeout",
             "host": host,
             "_neighbor_rows": [],
+            **empty_iw_station_info(),
         }
 
     row: Dict[str, object] = {
@@ -1235,6 +1716,7 @@ def fetch_remote_wifi_state(
         "error": "",
         "host": host,
         "_neighbor_rows": [],
+        **empty_iw_station_info(),
     }
 
     if result.returncode == 0:
@@ -1245,6 +1727,14 @@ def fetch_remote_wifi_state(
         row["ping_ms"] = parsed.get("PING_MS", "")
         row["ping_status"] = parsed.get("PING_STATUS", "")
         row["arp_target_state"] = parsed.get("ARP_TARGET_STATE", "")
+        encoded_iw = parsed.get("IW_STATION_B64", "")
+        if encoded_iw:
+            try:
+                iw_output = base64.b64decode(encoded_iw, validate=True).decode("utf-8", errors="replace")
+                row.update(parse_iw_station_dump(iw_output))
+            except (ValueError, UnicodeError):
+                pass
+        row["IwTxPowerDbm"] = parsed.get("IW_TX_POWER", "")
         if not row["bssid"]:
             row["error"] = "no_active_wifi"
     else:
