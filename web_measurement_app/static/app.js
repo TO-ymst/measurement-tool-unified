@@ -133,6 +133,7 @@ async function loadDefaults() {
     form.interval.value = data.interval;
     form.ping_fail_value.value = data.ping_fail_value;
     form.ping_timeout_ms.value = data.ping_timeout_ms;
+    if (form.ping_stats_window_sec) form.ping_stats_window_sec.value = data.ping_stats_window_sec ?? 30;
     form.wifi_disconnected_value.value = data.wifi_disconnected_value;
     if (form.wifi_reconnect_cooldown_sec) form.wifi_reconnect_cooldown_sec.value = data.wifi_reconnect_cooldown_sec ?? 5;
     form.log_base.value = data.log_base;
@@ -150,6 +151,8 @@ async function loadDefaults() {
     if (form.exclusive_ssid_during_measurement) {
       form.exclusive_ssid_during_measurement.checked = data.exclusive_ssid_during_measurement !== false;
     }
+    if (form.survey_enabled) form.survey_enabled.checked = !!data.survey_enabled;
+    if (form.survey_interval_sec) form.survey_interval_sec.value = data.survey_interval_sec ?? 5;
     if (form.remote_enable_neighbor_scan) form.remote_enable_neighbor_scan.checked = !!data.remote_enable_neighbor_scan;
     if (form.remote_setup_ssh_key) form.remote_setup_ssh_key.checked = !!data.remote_setup_ssh_key;
     if (form.remote_cleanup_ssh_key) form.remote_cleanup_ssh_key.checked = !!data.remote_cleanup_ssh_key;
@@ -826,6 +829,7 @@ function buildPayload() {
     "sync_time",
     "auto_reconnect_wifi",
     "exclusive_ssid_during_measurement",
+    "survey_enabled",
     "remote_enable_neighbor_scan",
     "remote_setup_ssh_key",
     "remote_cleanup_ssh_key",
@@ -843,6 +847,7 @@ function buildPayload() {
     "interval",
     "ping_fail_value",
     "ping_timeout_ms",
+    "ping_stats_window_sec",
     "wifi_disconnected_value",
     "wifi_reconnect_cooldown_sec",
     "channel_min",
@@ -852,6 +857,7 @@ function buildPayload() {
     "remote_neighbor_every",
     "remote_advanced_ping_timeout_streak",
     "remote_advanced_max_output_chars",
+    "survey_interval_sec",
   ];
   fd.forEach((value, key) => {
     if (value === "" && key !== "prefix" && key !== "ping_target") {
@@ -875,6 +881,8 @@ function buildPayload() {
   payload.remote_advanced_ping_timeout_streak = Number(fd.get("remote_advanced_ping_timeout_streak")) || 1;
   payload.remote_advanced_max_output_chars = Number(fd.get("remote_advanced_max_output_chars")) || 12000;
   payload.wifi_reconnect_cooldown_sec = Number(fd.get("wifi_reconnect_cooldown_sec")) || 5;
+  payload.ping_stats_window_sec = Number(fd.get("ping_stats_window_sec")) || 30;
+  payload.survey_interval_sec = Number(fd.get("survey_interval_sec")) || 5;
   return payload;
 }
 

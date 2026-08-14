@@ -1,11 +1,16 @@
 import unittest
+import time
 from pathlib import Path
 
 from web_measurement_app.logger_core import (
     HEADERS,
     IW_HEADERS,
     LEGACY_HEADERS,
+    PING_STAT_HEADERS,
+    RUNTIME_HEADERS,
+    SURVEY_HEADERS,
     build_nmcli_command,
+    parse_iw_survey_dump,
     parse_iw_station_dump,
 )
 from web_measurement_app.service import MeasurementConfig, MeasurementService
@@ -60,7 +65,14 @@ class IwDiagnosticsTest(unittest.TestCase):
     def test_legacy_columns_are_unchanged_and_first(self):
         self.assertEqual(LEGACY_HEADERS, EXPECTED_LEGACY_HEADERS)
         self.assertEqual(HEADERS[: len(LEGACY_HEADERS)], EXPECTED_LEGACY_HEADERS)
-        self.assertEqual(HEADERS[len(LEGACY_HEADERS) :], IW_HEADERS)
+        iw_start = len(LEGACY_HEADERS)
+        ping_start = iw_start + len(IW_HEADERS)
+        runtime_start = ping_start + len(PING_STAT_HEADERS)
+        survey_start = runtime_start + len(RUNTIME_HEADERS)
+        self.assertEqual(HEADERS[iw_start:ping_start], IW_HEADERS)
+        self.assertEqual(HEADERS[ping_start:runtime_start], PING_STAT_HEADERS)
+        self.assertEqual(HEADERS[runtime_start:survey_start], RUNTIME_HEADERS)
+        self.assertEqual(HEADERS[survey_start:], SURVEY_HEADERS)
 
     def test_station_dump_parser(self):
         output = """Station 30:de:4b:4a:12:67 (on wlan0)
@@ -127,6 +139,81 @@ class IwDiagnosticsTest(unittest.TestCase):
         prepared = service._prepare_iw_info(info, "78:8C:B5:9A:DE:29")
 
         self.assertTrue(all(prepared[key] == "" for key in IW_HEADERS))
+
+    def test_ping_statistics_use_existing_samples_only(self):
+        service = MeasurementService()
+        config = MeasurementConfig(ping_stats_window_sec=30)
+        first = service._ping_stat_columns("10", "ok", config)
+        second = service._ping_stat_columns("20", "ok", config)
+        timeout = service._ping_stat_columns("999", "ping_timeout", config)
+
+        self.assertEqual(first[0:3], ["1", "1", "0.000"])
+        self.assertEqual(second[0:5], ["2", "2", "0.000", "15.000", "15.000"])
+        self.assertEqual(timeout[0:3], ["3", "2", "33.333"])
+
+    def test_runtime_diagnostics_append_after_existing_columns(self):
+        service = MeasurementService()
+        service._config = MeasurementConfig(survey_enabled=False)
+        service._begin_sample()
+        line = ["" for _header in LEGACY_HEADERS + IW_HEADERS]
+        line[12] = "12.5"
+        line[13] = "ok"
+
+        service._append_runtime_diagnostics(line)
+
+        self.assertEqual(len(line), len(HEADERS))
+        self.assertEqual(line[len(LEGACY_HEADERS) + len(IW_HEADERS)], "1")
+        self.assertTrue(line[len(LEGACY_HEADERS) + len(IW_HEADERS) + len(PING_STAT_HEADERS)] != "")
+        self.assertTrue(all(value == "" for value in line[-len(SURVEY_HEADERS) :]))
+
+    def test_survey_is_not_started_by_default(self):
+        service = MeasurementService()
+        service._schedule_survey(MeasurementConfig(survey_enabled=False))
+
+        self.assertIsNone(service._survey_thread)
+
+    def test_survey_parser_uses_in_use_channel(self):
+        output = """Survey data from wlan0
+	frequency:                      5180 MHz [in use]
+	noise:                          -95 dBm
+	channel active time:            1000 ms
+	channel busy time:              250 ms
+	channel receive time:           125 ms
+	channel transmit time:          50 ms
+Survey data from wlan0
+	frequency:                      5200 MHz
+	channel active time:            9999 ms
+"""
+        info = parse_iw_survey_dump(output)
+        self.assertEqual(info["SurveySampleValid"], "yes")
+        self.assertEqual(info["SurveyFrequencyMhz"], "5180")
+        self.assertEqual(info["SurveyNoiseDbm"], "-95")
+        self.assertEqual(info["SurveyBusyMsTotal"], "250")
+
+    def test_survey_busy_rate_uses_counter_deltas(self):
+        service = MeasurementService()
+        config = MeasurementConfig(survey_enabled=True)
+        first = {
+            "SurveySampleValid": "yes",
+            "SurveyFrequencyMhz": "5180",
+            "SurveyNoiseDbm": "-95",
+            "SurveyActiveMsTotal": "1000",
+            "SurveyBusyMsTotal": "250",
+            "SurveyRxMsTotal": "125",
+            "SurveyTxMsTotal": "50",
+        }
+        second = {**first, "SurveyActiveMsTotal": "1400", "SurveyBusyMsTotal": "450"}
+        with service._survey_lock:
+            service._pending_survey_result = {"info": first, "captured_monotonic": time.monotonic()}
+        initial = service._survey_columns(config)
+        with service._survey_lock:
+            service._pending_survey_result = {"info": second, "captured_monotonic": time.monotonic()}
+        updated = service._survey_columns(config)
+
+        self.assertEqual(initial[SURVEY_HEADERS.index("SurveyActiveMsDelta")], "")
+        self.assertEqual(updated[SURVEY_HEADERS.index("SurveyActiveMsDelta")], "400")
+        self.assertEqual(updated[SURVEY_HEADERS.index("SurveyBusyMsDelta")], "200")
+        self.assertEqual(updated[SURVEY_HEADERS.index("SurveyBusyRatePct")], "50.000")
 
 
 if __name__ == "__main__":

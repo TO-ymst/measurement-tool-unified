@@ -134,9 +134,10 @@ select {
 .flow-measurement-parameters { order: 3; }
 .flow-local-config { order: 4; }
 .flow-remote-config { order: 5; }
-.flow-neighbor-config { order: 6; }
-.flow-ping-target { order: 7; }
-.flow-measurement-actions { order: 8; }
+.flow-diagnostics-config { order: 6; }
+.flow-neighbor-config { order: 7; }
+.flow-ping-target { order: 8; }
+.flow-measurement-actions { order: 9; }
 
 .wifi-switch-divider {
   margin: 1rem 0;

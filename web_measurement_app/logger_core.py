@@ -86,7 +86,39 @@ IW_HEADERS = [
     "IwRxDropMisc",
 ]
 
-HEADERS = LEGACY_HEADERS + IW_HEADERS
+PING_STAT_HEADERS = [
+    "PingWindowSamples",
+    "PingWindowSuccesses",
+    "PingLossRatePct",
+    "PingRttMeanMs",
+    "PingRttMedianMs",
+    "PingRttMinMs",
+    "PingRttMaxMs",
+    "PingRttP95Ms",
+    "PingRttP99Ms",
+    "PingJitterMeanMs",
+]
+
+RUNTIME_HEADERS = [
+    "SampleDurationMs",
+    "SamplePeriodMs",
+    "ScheduleOverrunMs",
+]
+
+SURVEY_HEADERS = [
+    "SurveySampleValid",
+    "SurveyUpdated",
+    "SurveyAgeMs",
+    "SurveyFrequencyMhz",
+    "SurveyNoiseDbm",
+    "SurveyActiveMsDelta",
+    "SurveyBusyMsDelta",
+    "SurveyRxMsDelta",
+    "SurveyTxMsDelta",
+    "SurveyBusyRatePct",
+]
+
+HEADERS = LEGACY_HEADERS + IW_HEADERS + PING_STAT_HEADERS + RUNTIME_HEADERS + SURVEY_HEADERS
 IW_COMMAND_TIMEOUT_SEC = 0.5
 
 NEIGHBOR_HEADERS = [
@@ -133,6 +165,9 @@ DEFAULT_PING_FAIL_VALUE = 999.0
 DEFAULT_PING_TIMEOUT_MS = 2000
 DEFAULT_WIFI_DISCONNECTED_VALUE = 999.0
 DEFAULT_WIFI_RECONNECT_COOLDOWN_SEC = 5
+DEFAULT_PING_STATS_WINDOW_SEC = 30
+DEFAULT_SURVEY_ENABLED = False
+DEFAULT_SURVEY_INTERVAL_SEC = 5.0
 FIXED_BSSID_RECONNECT_WAIT_SEC = 15
 FIXED_BSSID_SCAN_SETTLE_SEC = 3.0
 FIXED_BSSID_SCAN_POLL_SEC = 0.5
@@ -925,6 +960,61 @@ def fetch_local_iw_tx_power(interface: str = "wlan0") -> str:
     return match.group(1) if match else ""
 
 
+def empty_iw_survey_info() -> Dict[str, str]:
+    return {
+        "SurveySampleValid": "",
+        "SurveyFrequencyMhz": "",
+        "SurveyNoiseDbm": "",
+        "SurveyActiveMsTotal": "",
+        "SurveyBusyMsTotal": "",
+        "SurveyRxMsTotal": "",
+        "SurveyTxMsTotal": "",
+    }
+
+
+def parse_iw_survey_dump(output: str) -> Dict[str, str]:
+    info = empty_iw_survey_info()
+    blocks = re.split(r"(?=Survey data from )", output or "")
+    active_block = next((block for block in blocks if "[in use]" in block), "")
+    if not active_block:
+        return info
+
+    info["SurveySampleValid"] = "yes"
+    patterns = {
+        "SurveyFrequencyMhz": r"^\s*frequency:\s*(\d+)\s*MHz",
+        "SurveyNoiseDbm": r"^\s*noise:\s*(-?\d+)\s*dBm",
+        "SurveyActiveMsTotal": r"^\s*channel active time:\s*(\d+)\s*ms",
+        "SurveyBusyMsTotal": r"^\s*channel busy time:\s*(\d+)\s*ms",
+        "SurveyRxMsTotal": r"^\s*channel receive time:\s*(\d+)\s*ms",
+        "SurveyTxMsTotal": r"^\s*channel transmit time:\s*(\d+)\s*ms",
+    }
+    for key, pattern in patterns.items():
+        match = re.search(pattern, active_block, re.IGNORECASE | re.MULTILINE)
+        if match:
+            info[key] = match.group(1)
+    return info
+
+
+def fetch_local_iw_survey_info(interface: str = "wlan0") -> Dict[str, str]:
+    if IS_WINDOWS:
+        return empty_iw_survey_info()
+    try:
+        result = subprocess.run(
+            ["iw", "dev", interface, "survey", "dump"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=IW_COMMAND_TIMEOUT_SEC,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return empty_iw_survey_info()
+    if result.returncode != 0:
+        return empty_iw_survey_info()
+    return parse_iw_survey_dump(result.stdout or "")
+
+
 def _fixed_bssid_is_visible(use_sudo: bool, device: str, bssid: str) -> bool:
     # Called only while disconnected from the measurement target.
     try:
@@ -1587,6 +1677,32 @@ def probe_remote_ssh(
         timeout=10,
     )
     return (result.stdout or "").strip()
+
+
+def fetch_remote_iw_survey_info(
+    host: str,
+    user: str,
+    port: int,
+    identity_file: Optional[str],
+    interface: str = "wlan0",
+) -> Dict[str, str]:
+    command = shlex.join(["iw", "dev", interface, "survey", "dump"])
+    ssh_cmd = ["ssh", *_base_remote(port, identity_file), _build_target(user, host), command]
+    try:
+        result = subprocess.run(
+            ssh_cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        return empty_iw_survey_info()
+    if result.returncode != 0:
+        return empty_iw_survey_info()
+    return parse_iw_survey_dump(result.stdout or "")
 
 
 def reconnect_remote_wifi(

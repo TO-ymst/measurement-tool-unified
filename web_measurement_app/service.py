@@ -4,6 +4,7 @@ import asyncio
 import csv
 import datetime as dt
 import json
+import math
 import threading
 import time
 from collections import defaultdict, deque
@@ -27,6 +28,7 @@ from .logger_core import (
     DEFAULT_PING_FAIL_VALUE,
     DEFAULT_PING_TARGET,
     DEFAULT_PING_TIMEOUT_MS,
+    DEFAULT_PING_STATS_WINDOW_SEC,
     DEFAULT_REMOTE_NEIGHBOR_EVERY,
     DEFAULT_REMOTE_PORT,
     DEFAULT_REMOTE_USER,
@@ -36,6 +38,8 @@ from .logger_core import (
     DEFAULT_USE_SUDO,
     DEFAULT_WIFI_RECONNECT_COOLDOWN_SEC,
     DEFAULT_WIFI_DISCONNECTED_VALUE,
+    DEFAULT_SURVEY_ENABLED,
+    DEFAULT_SURVEY_INTERVAL_SEC,
     HEADERS,
     IW_HEADERS,
     NEIGHBOR_HEADERS,
@@ -43,7 +47,9 @@ from .logger_core import (
     collect_remote_advanced_snapshot,
     ensure_remote_ssh_key,
     fetch_remote_wifi_state,
+    fetch_remote_iw_survey_info,
     fetch_local_iw_station_info,
+    fetch_local_iw_survey_info,
     fetch_local_iw_tx_power,
     fetch_wifi_rows,
     get_current_local_wifi_state,
@@ -65,6 +71,9 @@ from .logger_core import (
     set_local_wifi_ap_lock,
     set_local_wifi_bssid_lock,
     should_run_neighbor_scan,
+    PING_STAT_HEADERS,
+    RUNTIME_HEADERS,
+    SURVEY_HEADERS,
     switch_local_wifi_ssid,
     switch_local_wifi_bssid,
 )
@@ -81,6 +90,7 @@ class MeasurementConfig(BaseModel):
     interval: float = Field(default=DEFAULT_INTERVAL, gt=0)
     ping_fail_value: float = Field(default=DEFAULT_PING_FAIL_VALUE)
     ping_timeout_ms: int = Field(default=DEFAULT_PING_TIMEOUT_MS, ge=1, le=60000)
+    ping_stats_window_sec: int = Field(default=DEFAULT_PING_STATS_WINDOW_SEC, ge=5, le=300)
     timeout_as_numeric: bool = Field(default=True)
     wifi_disconnected_value: float = Field(default=DEFAULT_WIFI_DISCONNECTED_VALUE)
     auto_reconnect_wifi: bool = Field(default=True)
@@ -93,6 +103,8 @@ class MeasurementConfig(BaseModel):
     sync_time: bool = Field(default=False)
     timezone: str = Field(default=DEFAULT_TIMEZONE)
     retain_rows: int = Field(default=20000, ge=1000, le=200000)
+    survey_enabled: bool = Field(default=DEFAULT_SURVEY_ENABLED)
+    survey_interval_sec: float = Field(default=DEFAULT_SURVEY_INTERVAL_SEC, ge=1.0, le=3600.0)
     remote_host: Optional[str] = None
     remote_user: str = Field(default=DEFAULT_REMOTE_USER)
     remote_port: int = Field(default=DEFAULT_REMOTE_PORT, ge=1, le=65535)
@@ -243,6 +255,12 @@ class MeasurementService:
         self._neighbor_scan_thread: Optional[threading.Thread] = None
         self._pending_neighbor_result: Optional[Dict[str, Any]] = None
         self._neighbor_scan_generation = 0
+        self._survey_lock = threading.Lock()
+        self._survey_thread: Optional[threading.Thread] = None
+        self._pending_survey_result: Optional[Dict[str, Any]] = None
+        self._latest_survey_result: Optional[Dict[str, Any]] = None
+        self._survey_generation = 0
+        self._last_survey_started_monotonic = 0.0
         self._current_point = 1
         self._log_index = 0
         self._listeners: Set[asyncio.Queue] = set()
@@ -267,6 +285,11 @@ class MeasurementService:
         self._last_wifi_reconnect_attempt = 0.0
         self._measurement_ssid_lock_owned = False
         self._last_iw_counters: Optional[Dict[str, Any]] = None
+        self._last_survey_counters: Optional[Dict[str, Any]] = None
+        self._ping_window: Deque[Tuple[float, Optional[float]]] = deque()
+        self._sample_started_monotonic: Optional[float] = None
+        self._previous_sample_started_monotonic: Optional[float] = None
+        self._sample_period_ms: Optional[float] = None
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -290,6 +313,10 @@ class MeasurementService:
             self._neighbor_scan_index = 0
             self._neighbor_scan_generation += 1
             self._pending_neighbor_result = None
+            self._survey_generation += 1
+            self._pending_survey_result = None
+            self._latest_survey_result = None
+            self._last_survey_started_monotonic = 0.0
             self._advanced_log_path = (
                 prepare_sidecar_file(prefix, f"{config.log_base}_remote_advanced", config.output_dir, ".jsonl")
                 if config.measurement_mode == "remote_ssh" and config.remote_advanced_enabled
@@ -300,6 +327,11 @@ class MeasurementService:
             self._remote_timeout_snapshot_taken = False
             self._last_wifi_reconnect_attempt = 0.0
             self._last_iw_counters = None
+            self._last_survey_counters = None
+            self._ping_window.clear()
+            self._sample_started_monotonic = None
+            self._previous_sample_started_monotonic = None
+            self._sample_period_ms = None
             with self._connection_event_path.open("w", newline="", encoding="utf-8-sig") as event_file:
                 csv.writer(event_file).writerow(CONNECTION_EVENT_HEADERS)
 
@@ -360,6 +392,8 @@ class MeasurementService:
             self._stop_event.set()
             thread = self._thread
             config = self._config
+        with self._survey_lock:
+            self._survey_generation += 1
         with self._local_reconnect_lock:
             reconnect_thread = self._local_reconnect_thread
         if thread and thread.is_alive():
@@ -861,6 +895,193 @@ class MeasurementService:
         with self._lock:
             self._listeners.discard(queue)
 
+    def _begin_sample(self) -> None:
+        started = time.monotonic()
+        previous = self._previous_sample_started_monotonic
+        self._sample_started_monotonic = started
+        self._sample_period_ms = (started - previous) * 1000 if previous is not None else None
+        self._previous_sample_started_monotonic = started
+
+    @staticmethod
+    def _format_metric(value: Optional[float]) -> str:
+        return f"{value:.3f}" if value is not None else ""
+
+    @staticmethod
+    def _percentile(values: List[float], percentile: float) -> Optional[float]:
+        if not values:
+            return None
+        ordered = sorted(values)
+        position = (len(ordered) - 1) * percentile
+        lower = int(position)
+        upper = min(lower + 1, len(ordered) - 1)
+        fraction = position - lower
+        return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+    def _ping_stat_columns(self, ping_value: Any, ping_status: Any, config: MeasurementConfig) -> List[str]:
+        now = time.monotonic()
+        status = str(ping_status or "")
+        rtt: Optional[float] = None
+        if status == "ok":
+            try:
+                candidate = float(str(ping_value).strip())
+                if math.isfinite(candidate):
+                    rtt = candidate
+            except (TypeError, ValueError):
+                pass
+        if status in {"ok", "ping_timeout", "timeout"}:
+            self._ping_window.append((now, rtt))
+        cutoff = now - config.ping_stats_window_sec
+        while self._ping_window and self._ping_window[0][0] < cutoff:
+            self._ping_window.popleft()
+
+        samples = list(self._ping_window)
+        successful = [value for _timestamp, value in samples if value is not None]
+        loss_rate = ((len(samples) - len(successful)) / len(samples) * 100) if samples else None
+        jitter_values = [
+            abs(successful[index] - successful[index - 1])
+            for index in range(1, len(successful))
+        ]
+        return [
+            str(len(samples)),
+            str(len(successful)),
+            self._format_metric(loss_rate),
+            self._format_metric(sum(successful) / len(successful) if successful else None),
+            self._format_metric(self._percentile(successful, 0.5)),
+            self._format_metric(min(successful) if successful else None),
+            self._format_metric(max(successful) if successful else None),
+            self._format_metric(self._percentile(successful, 0.95)),
+            self._format_metric(self._percentile(successful, 0.99)),
+            self._format_metric(sum(jitter_values) / len(jitter_values) if jitter_values else None),
+        ]
+
+    def _schedule_survey(self, config: MeasurementConfig) -> None:
+        if not config.survey_enabled:
+            return
+        now = time.monotonic()
+        with self._survey_lock:
+            if self._survey_thread and self._survey_thread.is_alive():
+                return
+            if now - self._last_survey_started_monotonic < config.survey_interval_sec:
+                return
+            self._last_survey_started_monotonic = now
+            generation = self._survey_generation
+            self._survey_thread = threading.Thread(
+                target=self._survey_worker,
+                args=(config, generation),
+                daemon=True,
+                name="wifi-iw-survey",
+            )
+            self._survey_thread.start()
+
+    def _survey_worker(self, config: MeasurementConfig, generation: int) -> None:
+        try:
+            if config.measurement_mode == "remote_ssh":
+                info = fetch_remote_iw_survey_info(
+                    host=config.remote_host or "",
+                    user=config.remote_user,
+                    port=config.remote_port,
+                    identity_file=config.remote_identity_file,
+                )
+            else:
+                info = fetch_local_iw_survey_info()
+            result = {"info": info, "captured_monotonic": time.monotonic()}
+        except Exception:  # noqa: BLE001
+            result = {"info": {}, "captured_monotonic": time.monotonic()}
+        with self._survey_lock:
+            if generation == self._survey_generation:
+                self._pending_survey_result = result
+
+    @staticmethod
+    def _survey_counter(info: Dict[str, Any], key: str) -> Optional[int]:
+        try:
+            return int(str(info.get(key, "")).strip())
+        except (TypeError, ValueError):
+            return None
+
+    def _survey_columns(self, config: MeasurementConfig) -> List[str]:
+        empty = ["" for _header in SURVEY_HEADERS]
+        if not config.survey_enabled:
+            return empty
+        with self._survey_lock:
+            pending = self._pending_survey_result
+            self._pending_survey_result = None
+        updated = pending is not None
+        if pending is not None:
+            self._latest_survey_result = pending
+        latest = self._latest_survey_result
+        if not latest:
+            return empty
+
+        info = dict(latest.get("info") or {})
+        if str(info.get("SurveySampleValid", "")) != "yes":
+            return empty
+        captured = float(latest.get("captured_monotonic") or time.monotonic())
+        age_ms = max(0.0, (time.monotonic() - captured) * 1000)
+        values = {
+            "SurveySampleValid": "yes",
+            "SurveyUpdated": "yes" if updated else "no",
+            "SurveyAgeMs": self._format_metric(age_ms),
+            "SurveyFrequencyMhz": str(info.get("SurveyFrequencyMhz", "") or ""),
+            "SurveyNoiseDbm": str(info.get("SurveyNoiseDbm", "") or ""),
+            "SurveyActiveMsDelta": "",
+            "SurveyBusyMsDelta": "",
+            "SurveyRxMsDelta": "",
+            "SurveyTxMsDelta": "",
+            "SurveyBusyRatePct": "",
+        }
+        if updated:
+            current = {
+                "frequency": values["SurveyFrequencyMhz"],
+                "active": self._survey_counter(info, "SurveyActiveMsTotal"),
+                "busy": self._survey_counter(info, "SurveyBusyMsTotal"),
+                "rx": self._survey_counter(info, "SurveyRxMsTotal"),
+                "tx": self._survey_counter(info, "SurveyTxMsTotal"),
+            }
+            previous = self._last_survey_counters
+            if previous and previous.get("frequency") == current["frequency"]:
+                deltas: Dict[str, int] = {}
+                for name in ("active", "busy", "rx", "tx"):
+                    old = previous.get(name)
+                    new = current.get(name)
+                    if old is None or new is None or new < old:
+                        deltas = {}
+                        break
+                    deltas[name] = new - old
+                if deltas:
+                    values["SurveyActiveMsDelta"] = str(deltas["active"])
+                    values["SurveyBusyMsDelta"] = str(deltas["busy"])
+                    values["SurveyRxMsDelta"] = str(deltas["rx"])
+                    values["SurveyTxMsDelta"] = str(deltas["tx"])
+                    if deltas["active"] > 0:
+                        values["SurveyBusyRatePct"] = self._format_metric(
+                            deltas["busy"] / deltas["active"] * 100
+                        )
+            self._last_survey_counters = current
+        return [values[header] for header in SURVEY_HEADERS]
+
+    def _append_runtime_diagnostics(self, log_line: List[Any]) -> None:
+        config = self._config
+        if not config:
+            log_line.extend(["" for _header in PING_STAT_HEADERS + RUNTIME_HEADERS + SURVEY_HEADERS])
+            return
+        log_line.extend(self._ping_stat_columns(log_line[12], log_line[13], config))
+        started = self._sample_started_monotonic
+        duration_ms = (time.monotonic() - started) * 1000 if started is not None else None
+        period_ms = self._sample_period_ms
+        overrun_ms = (
+            max(0.0, duration_ms - config.interval * 1000)
+            if duration_ms is not None
+            else None
+        )
+        log_line.extend(
+            [
+                self._format_metric(duration_ms),
+                self._format_metric(period_ms),
+                self._format_metric(overrun_ms),
+            ]
+        )
+        log_line.extend(self._survey_columns(config))
+
     def _run_loop(self) -> None:
         assert self._config and self._log_path and self._neighbor_log_path and self._ping_target_info
         config = self._config
@@ -881,6 +1102,8 @@ class MeasurementService:
 
                         while not self._stop_event.is_set():
                             sample_no += 1
+                            self._begin_sample()
+                            self._schedule_survey(config)
                             if config.measurement_mode == "remote_ssh":
                                 record = self._run_remote_iteration(
                                     writer, csv_file, neighbor_writer, config, sample_no
@@ -1371,6 +1594,7 @@ class MeasurementService:
         message: str,
         retain_rows: int,
     ) -> Dict[str, Any]:
+        self._append_runtime_diagnostics(log_line)
         writer.writerow(log_line)
         csv_file.flush()
         self._log_index += 1
