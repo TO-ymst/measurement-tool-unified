@@ -160,7 +160,7 @@ DEFAULT_LOG_BASE = "rec_wifi_logs"
 DEFAULT_TIMEZONE = "Asia/Tokyo"
 DEFAULT_USE_GATEWAY = True
 DEFAULT_PING_TARGET = "192.168.30.1"
-DEFAULT_INTERVAL = 1.0
+DEFAULT_INTERVAL = 0.5
 DEFAULT_PING_FAIL_VALUE = 999.0
 DEFAULT_PING_TIMEOUT_MS = 2000
 DEFAULT_WIFI_DISCONNECTED_VALUE = 999.0
@@ -357,16 +357,21 @@ def _select_best_neighbor(
     return candidates[0]
 
 
+def combine_log_name(prefix: str, base_name: str) -> str:
+    """Join optional prefix and base name with exactly one underscore."""
+    safe_prefix = (prefix or "").rstrip("_")
+    safe_base = (base_name or "").lstrip("_")
+    return f"{safe_prefix}_{safe_base}" if safe_prefix else safe_base
+
+
 def prepare_log_file(prefix: str, base_name: str, output_dir: str) -> Path:
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_prefix = prefix or ""
-    if safe_prefix and not safe_prefix.endswith("_"):
-        safe_prefix += "_"
+    log_name = combine_log_name(prefix, base_name)
     os.makedirs(output_dir, exist_ok=True)
-    candidate = Path(output_dir) / f"{safe_prefix}{base_name}_{timestamp}.csv"
+    candidate = Path(output_dir) / f"{log_name}_{timestamp}.csv"
     counter = 1
     while candidate.exists():
-        candidate = Path(output_dir) / f"{safe_prefix}{base_name}_{timestamp}_{counter}.csv"
+        candidate = Path(output_dir) / f"{log_name}_{timestamp}_{counter}.csv"
         counter += 1
     return candidate
 
@@ -436,14 +441,12 @@ def apply_neighbor_summary(
 
 def prepare_sidecar_file(prefix: str, base_name: str, output_dir: str, suffix: str) -> Path:
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_prefix = prefix or ""
-    if safe_prefix and not safe_prefix.endswith("_"):
-        safe_prefix += "_"
+    log_name = combine_log_name(prefix, base_name)
     os.makedirs(output_dir, exist_ok=True)
-    candidate = Path(output_dir) / f"{safe_prefix}{base_name}_{timestamp}{suffix}"
+    candidate = Path(output_dir) / f"{log_name}_{timestamp}{suffix}"
     counter = 1
     while candidate.exists():
-        candidate = Path(output_dir) / f"{safe_prefix}{base_name}_{timestamp}_{counter}{suffix}"
+        candidate = Path(output_dir) / f"{log_name}_{timestamp}_{counter}{suffix}"
         counter += 1
     return candidate
 

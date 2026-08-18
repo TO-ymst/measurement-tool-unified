@@ -8,6 +8,8 @@ import math
 import threading
 import time
 from collections import defaultdict, deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Set, TextIO, Tuple
 
@@ -77,6 +79,8 @@ from .logger_core import (
     switch_local_wifi_ssid,
     switch_local_wifi_bssid,
 )
+
+IW_SIGNAL_DBM_INDEX = HEADERS.index("IwSignalDbm")
 
 
 class MeasurementConfig(BaseModel):
@@ -154,6 +158,13 @@ class MeasurementConfig(BaseModel):
             raise ValueError("measurement_mode must be local or remote_ssh")
         return value
 
+    @validator("interval")
+    def validate_interval(cls, value: float) -> float:
+        allowed = (0.2, 0.5, 1.0, 2.0, 5.0)
+        if value not in allowed:
+            raise ValueError(f"interval must be one of {allowed}")
+        return value
+
     @validator("band")
     def validate_band(cls, value: str) -> str:
         if value not in CHANNEL_FILTER:
@@ -201,6 +212,19 @@ class MeasurementStatus(BaseModel):
     config: Optional[MeasurementConfig]
     last_error: Optional[str]
     started_at: Optional[str]
+
+
+@dataclass
+class PendingLocalRow:
+    log_line: List[Any]
+    message: str
+    point: int
+    retain_rows: int
+    sample_started_monotonic: float
+    sample_duration_ms: float
+    sample_period_ms: Optional[float]
+    survey_columns: List[str]
+    completed: bool = False
 
 
 def synchronize_time(target_timezone: str) -> Optional[str]:
@@ -290,6 +314,12 @@ class MeasurementService:
         self._sample_started_monotonic: Optional[float] = None
         self._previous_sample_started_monotonic: Optional[float] = None
         self._sample_period_ms: Optional[float] = None
+        self._ping_executor: Optional[ThreadPoolExecutor] = None
+        self._ping_slots: Optional[threading.BoundedSemaphore] = None
+        self._ping_generation = 0
+        self._pending_local_rows: Dict[int, PendingLocalRow] = {}
+        self._next_local_csv_index = 0
+        self._pending_local_lock = threading.Lock()
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -332,6 +362,9 @@ class MeasurementService:
             self._sample_started_monotonic = None
             self._previous_sample_started_monotonic = None
             self._sample_period_ms = None
+            self._ping_generation += 1
+            self._pending_local_rows.clear()
+            self._next_local_csv_index = 0
             with self._connection_event_path.open("w", newline="", encoding="utf-8-sig") as event_file:
                 csv.writer(event_file).writerow(CONNECTION_EVENT_HEADERS)
 
@@ -378,9 +411,21 @@ class MeasurementService:
 
             try:
                 self._original_timezone = synchronize_time(config.timezone) if config.sync_time else None
+                if config.measurement_mode == "local":
+                    timeout_sec = max(1, math.ceil(config.ping_timeout_ms / 1000))
+                    max_workers = min(32, max(2, math.ceil(timeout_sec / config.interval) + 2))
+                    self._ping_executor = ThreadPoolExecutor(
+                        max_workers=max_workers,
+                        thread_name_prefix="wifi-ping",
+                    )
+                    self._ping_slots = threading.BoundedSemaphore(max_workers)
                 self._thread = threading.Thread(target=self._run_loop, name="wifi-logger", daemon=True)
                 self._thread.start()
             except Exception:
+                if self._ping_executor is not None:
+                    self._ping_executor.shutdown(wait=False)
+                    self._ping_executor = None
+                    self._ping_slots = None
                 if self._measurement_ssid_lock_owned:
                     set_local_wifi_ap_lock(config.use_sudo, False)
                     self._measurement_ssid_lock_owned = False
@@ -397,7 +442,8 @@ class MeasurementService:
         with self._local_reconnect_lock:
             reconnect_thread = self._local_reconnect_thread
         if thread and thread.is_alive():
-            thread.join(timeout=5)
+            ping_wait_sec = (config.ping_timeout_ms / 1000 + 2) if config else 5
+            thread.join(timeout=max(5, ping_wait_sec))
         if reconnect_thread and reconnect_thread.is_alive():
             reconnect_thread.join(timeout=5)
         if (
@@ -917,8 +963,14 @@ class MeasurementService:
         fraction = position - lower
         return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
-    def _ping_stat_columns(self, ping_value: Any, ping_status: Any, config: MeasurementConfig) -> List[str]:
-        now = time.monotonic()
+    def _ping_stat_columns(
+        self,
+        ping_value: Any,
+        ping_status: Any,
+        config: MeasurementConfig,
+        observed_monotonic: Optional[float] = None,
+    ) -> List[str]:
+        now = observed_monotonic if observed_monotonic is not None else time.monotonic()
         status = str(ping_status or "")
         rtt: Optional[float] = None
         if status == "ok":
@@ -1059,15 +1111,32 @@ class MeasurementService:
             self._last_survey_counters = current
         return [values[header] for header in SURVEY_HEADERS]
 
-    def _append_runtime_diagnostics(self, log_line: List[Any]) -> None:
+    def _append_runtime_diagnostics(
+        self,
+        log_line: List[Any],
+        *,
+        sample_started_monotonic: Optional[float] = None,
+        duration_ms: Optional[float] = None,
+        period_ms: Optional[float] = None,
+        survey_columns: Optional[List[str]] = None,
+    ) -> None:
         config = self._config
         if not config:
             log_line.extend(["" for _header in PING_STAT_HEADERS + RUNTIME_HEADERS + SURVEY_HEADERS])
             return
-        log_line.extend(self._ping_stat_columns(log_line[12], log_line[13], config))
-        started = self._sample_started_monotonic
-        duration_ms = (time.monotonic() - started) * 1000 if started is not None else None
-        period_ms = self._sample_period_ms
+        log_line.extend(
+            self._ping_stat_columns(
+                log_line[12],
+                log_line[13],
+                config,
+                observed_monotonic=sample_started_monotonic,
+            )
+        )
+        if duration_ms is None:
+            started = self._sample_started_monotonic
+            duration_ms = (time.monotonic() - started) * 1000 if started is not None else None
+        if period_ms is None and sample_started_monotonic is None:
+            period_ms = self._sample_period_ms
         overrun_ms = (
             max(0.0, duration_ms - config.interval * 1000)
             if duration_ms is not None
@@ -1080,7 +1149,15 @@ class MeasurementService:
                 self._format_metric(overrun_ms),
             ]
         )
-        log_line.extend(self._survey_columns(config))
+        log_line.extend(survey_columns if survey_columns is not None else self._survey_columns(config))
+
+    def _wait_for_next_sample(self, interval: float) -> None:
+        started = self._sample_started_monotonic
+        if started is None:
+            wait_seconds = interval
+        else:
+            wait_seconds = max(0.0, started + interval - time.monotonic())
+        self._stop_event.wait(wait_seconds)
 
     def _run_loop(self) -> None:
         assert self._config and self._log_path and self._neighbor_log_path and self._ping_target_info
@@ -1121,22 +1198,25 @@ class MeasurementService:
                                     else target_ip
                                 )
                                 if self._local_reconnect_running():
-                                    self._write_local_disconnected_record(
-                                        writer, csv_file, config, target_ip, "wifi_reconnect_in_progress"
+                                    self._queue_local_disconnected_record(
+                                        config, target_ip, "wifi_reconnect_in_progress"
                                     )
                                 elif self._network_switch_lock.acquire(blocking=False):
                                     try:
                                         self._run_local_iteration(
-                                            writer, csv_file, neighbor_writer, config, target_ip, sample_no
+                                            neighbor_writer, config, target_ip, sample_no
                                         )
                                     finally:
                                         self._network_switch_lock.release()
                                 else:
-                                    self._write_local_disconnected_record(
-                                        writer, csv_file, config, target_ip, "network_switch_in_progress"
+                                    self._queue_local_disconnected_record(
+                                        config, target_ip, "network_switch_in_progress"
                                     )
-                            time.sleep(config.interval)
+                                self._flush_completed_local_rows(writer, csv_file)
+                            self._wait_for_next_sample(config.interval)
                     finally:
+                        if config.measurement_mode == "local":
+                            self._finish_local_ping_rows(writer, csv_file)
                         if advanced_file is not None:
                             advanced_file.close()
         except Exception as exc:  # noqa: BLE001
@@ -1293,13 +1373,12 @@ class MeasurementService:
 
     def _run_local_iteration(
         self,
-        writer: csv.writer,
-        csv_file,
         neighbor_writer: csv.writer,
         config: MeasurementConfig,
         target_ip: str,
         sample_no: int,
     ) -> None:
+        date_str, time_str, point_value = self._timestamp_and_point()
         try:
             wifi_rows = fetch_wifi_rows(
                 config.use_sudo,
@@ -1311,8 +1390,6 @@ class MeasurementService:
         except RuntimeError as exc:
             wifi_rows = []
             error_message = str(exc)
-
-        date_str, time_str, point_value = self._timestamp_and_point()
 
         neighbor_result = self._take_neighbor_scan_result()
         if neighbor_result:
@@ -1340,17 +1417,12 @@ class MeasurementService:
 
         if wifi_rows:
             for row in wifi_rows:
-                icmp_seq, ttl, time_ms, ping_status = get_ping_result(
-                    target_ip,
-                    config.timeout_as_numeric,
-                    config.ping_fail_value,
-                    config.ping_timeout_ms,
-                )
                 iw_info = fetch_local_iw_station_info()
                 iw_info["IwTxPowerDbm"] = fetch_local_iw_tx_power()
                 iw_info = self._prepare_iw_info(iw_info, row.get("bssid", ""))
+                log_index = self._reserve_log_index()
                 log_line = [
-                    self._log_index,
+                    log_index,
                     point_value,
                     date_str,
                     time_str,
@@ -1360,10 +1432,10 @@ class MeasurementService:
                     row["rate"],
                     row["signal"],
                     self._format_dbm(row.get("dbm", "")),
-                    icmp_seq,
-                    ttl,
-                    time_ms,
-                    ping_status,
+                    "",
+                    "",
+                    "",
+                    "ping_pending",
                     row.get("neighbor_scan_ran", "no"),
                     row.get("neighbor_match_ssid", ""),
                     row.get("neighbor_count_visible", ""),
@@ -1384,11 +1456,11 @@ class MeasurementService:
                     "",
                 ]
                 self._append_iw_columns(log_line, iw_info)
-                self._write_and_publish_record(writer, csv_file, log_line, error_message, config.retain_rows)
+                self._queue_local_ping_record(log_line, error_message, config, target_ip)
         else:
             self._schedule_local_wifi_reconnect(config)
-            self._write_local_disconnected_record(
-                writer, csv_file, config, target_ip, error_message or "wifi_disconnected"
+            self._queue_local_disconnected_record(
+                config, target_ip, error_message or "wifi_disconnected"
             )
 
     def _schedule_neighbor_scan(self, use_sudo: bool, target_ssid: Optional[str]) -> None:
@@ -1429,18 +1501,178 @@ class MeasurementService:
             self._pending_neighbor_result = None
             return result
 
-    def _write_local_disconnected_record(
+    def _reserve_log_index(self) -> int:
+        with self._lock:
+            log_index = self._log_index
+            self._log_index += 1
+        return log_index
+
+    def _local_sample_timing(self, config: MeasurementConfig) -> Tuple[float, float, Optional[float], List[str]]:
+        started = self._sample_started_monotonic
+        if started is None:
+            started = time.monotonic()
+        duration_ms = max(0.0, (time.monotonic() - started) * 1000)
+        return started, duration_ms, self._sample_period_ms, self._survey_columns(config)
+
+    def _register_pending_local_row(
         self,
-        writer: csv.writer,
-        csv_file,
+        log_line: List[Any],
+        message: str,
+        config: MeasurementConfig,
+        *,
+        completed: bool,
+    ) -> PendingLocalRow:
+        started, duration_ms, period_ms, survey_columns = self._local_sample_timing(config)
+        pending = PendingLocalRow(
+            log_line=log_line,
+            message=message,
+            point=int(log_line[1]),
+            retain_rows=config.retain_rows,
+            sample_started_monotonic=started,
+            sample_duration_ms=duration_ms,
+            sample_period_ms=period_ms,
+            survey_columns=survey_columns,
+            completed=completed,
+        )
+        with self._pending_local_lock:
+            self._pending_local_rows[int(log_line[0])] = pending
+        record = self._build_record(log_line, message)
+        record["ping_pending"] = not completed
+        self._upsert_history(pending.point, record, config.retain_rows)
+        self._publish(record)
+        return pending
+
+    def _queue_local_ping_record(
+        self,
+        log_line: List[Any],
+        message: str,
+        config: MeasurementConfig,
+        target_ip: str,
+    ) -> None:
+        self._register_pending_local_row(log_line, message, config, completed=False)
+        executor = self._ping_executor
+        slots = self._ping_slots
+        log_index = int(log_line[0])
+        generation = self._ping_generation
+        if executor is None or slots is None:
+            self._complete_local_ping(
+                log_index,
+                generation,
+                ("", "", str(config.ping_fail_value), "ping_error"),
+                "Ping worker is unavailable",
+            )
+            return
+        if not slots.acquire(blocking=False):
+            fallback = str(config.ping_fail_value) if config.timeout_as_numeric else "NaN"
+            self._complete_local_ping(
+                log_index,
+                generation,
+                ("", "", fallback, "ping_queue_full"),
+                "Ping concurrency limit reached",
+            )
+            return
+
+        future = executor.submit(
+            get_ping_result,
+            target_ip,
+            config.timeout_as_numeric,
+            config.ping_fail_value,
+            config.ping_timeout_ms,
+        )
+        future.add_done_callback(
+            lambda completed_future: self._local_ping_done(
+                log_index,
+                generation,
+                slots,
+                completed_future,
+                config,
+            )
+        )
+
+    def _local_ping_done(
+        self,
+        log_index: int,
+        generation: int,
+        slots: threading.BoundedSemaphore,
+        future: Future,
+        config: MeasurementConfig,
+    ) -> None:
+        error_message = ""
+        try:
+            result = future.result()
+        except Exception as exc:  # noqa: BLE001
+            fallback = str(config.ping_fail_value) if config.timeout_as_numeric else "NaN"
+            result = ("", "", fallback, "ping_error")
+            error_message = str(exc)
+        finally:
+            slots.release()
+        self._complete_local_ping(log_index, generation, result, error_message)
+
+    def _complete_local_ping(
+        self,
+        log_index: int,
+        generation: int,
+        result: Tuple[str, str, str, str],
+        error_message: str = "",
+    ) -> None:
+        with self._pending_local_lock:
+            if generation != self._ping_generation:
+                return
+            pending = self._pending_local_rows.get(log_index)
+            if pending is None:
+                return
+            pending.log_line[10:14] = list(result)
+            if error_message:
+                pending.log_line[31] = error_message
+                pending.message = error_message
+            pending.completed = True
+            record = self._build_record(pending.log_line, pending.message)
+            record["ping_pending"] = False
+            point = pending.point
+            retain_rows = pending.retain_rows
+        self._upsert_history(point, record, retain_rows)
+        self._publish(record)
+
+    def _flush_completed_local_rows(self, writer: csv.writer, csv_file) -> None:
+        wrote_row = False
+        while True:
+            with self._pending_local_lock:
+                pending = self._pending_local_rows.get(self._next_local_csv_index)
+                if pending is None or not pending.completed:
+                    break
+                del self._pending_local_rows[self._next_local_csv_index]
+                self._next_local_csv_index += 1
+            self._append_runtime_diagnostics(
+                pending.log_line,
+                sample_started_monotonic=pending.sample_started_monotonic,
+                duration_ms=pending.sample_duration_ms,
+                period_ms=pending.sample_period_ms,
+                survey_columns=pending.survey_columns,
+            )
+            writer.writerow(pending.log_line)
+            wrote_row = True
+        if wrote_row:
+            csv_file.flush()
+
+    def _finish_local_ping_rows(self, writer: csv.writer, csv_file) -> None:
+        executor = self._ping_executor
+        if executor is not None:
+            executor.shutdown(wait=True)
+        self._ping_executor = None
+        self._ping_slots = None
+        self._flush_completed_local_rows(writer, csv_file)
+
+    def _queue_local_disconnected_record(
+        self,
         config: MeasurementConfig,
         target_ip: str,
         error_message: str,
     ) -> None:
         date_str, time_str, point_value = self._timestamp_and_point()
         placeholder_time = str(config.wifi_disconnected_value) if config.timeout_as_numeric else "NaN"
+        log_index = self._reserve_log_index()
         log_line = [
-            self._log_index,
+            log_index,
             point_value,
             date_str,
             time_str,
@@ -1475,12 +1707,11 @@ class MeasurementService:
         ]
         self._last_iw_counters = None
         self._append_iw_columns(log_line, {})
-        self._write_and_publish_record(
-            writer,
-            csv_file,
+        self._register_pending_local_row(
             log_line,
             "Wi-Fi disconnected placeholder recorded",
-            config.retain_rows,
+            config,
+            completed=True,
         )
 
     @staticmethod
@@ -1695,6 +1926,7 @@ class MeasurementService:
             "rate": log_line[7],
             "signal_strength": log_line[8],
             "rssi_dbm": log_line[9],
+            "iw_signal_dbm": log_line[IW_SIGNAL_DBM_INDEX] if len(log_line) > IW_SIGNAL_DBM_INDEX else "",
             "icmp_seq": log_line[10],
             "ttl": log_line[11],
             "ping_ms": log_line[12],
@@ -1725,6 +1957,18 @@ class MeasurementService:
     def _append_history(self, point: int, record: Dict[str, Any], retain_rows: int) -> None:
         with self._lock:
             bucket = self._history[point]
+            bucket.append(record)
+            while len(bucket) > retain_rows:
+                bucket.popleft()
+
+    def _upsert_history(self, point: int, record: Dict[str, Any], retain_rows: int) -> None:
+        record_index = record.get("index")
+        with self._lock:
+            bucket = self._history[point]
+            for position in range(len(bucket) - 1, -1, -1):
+                if bucket[position].get("index") == record_index:
+                    bucket[position] = record
+                    return
             bucket.append(record)
             while len(bucket) > retain_rows:
                 bucket.popleft()

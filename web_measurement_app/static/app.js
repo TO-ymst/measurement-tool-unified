@@ -32,6 +32,7 @@ const grayscaleToggle = document.getElementById("grayscale-toggle");
 const grayscaleRange = document.getElementById("grayscale-range");
 const legendToggle = document.getElementById("legend-toggle");
 const legendContainer = document.getElementById("legend-container");
+const exportTitleModeSelect = document.getElementById("export-title-mode");
 const exportTitleInput = document.getElementById("export-title");
 const exportButton = document.getElementById("export-btn");
 const exportAllButton = document.getElementById("export-all-btn");
@@ -85,6 +86,7 @@ const state = {
   pointAdvancePending: false,
   renderFrame: null,
   currentLogFile: "",
+  currentLogPrefix: null,
   currentMode: "ping",
   image: null,
   view: {
@@ -275,6 +277,10 @@ function attachEvents() {
   }
   if (exportAllButton) {
     exportAllButton.addEventListener("click", exportAllLegendImages);
+  }
+  if (exportTitleModeSelect) {
+    exportTitleModeSelect.addEventListener("change", syncExportTitleControls);
+    syncExportTitleControls();
   }
   if (importAlignedBtn) {
     importAlignedBtn.addEventListener("click", handleImportAlignedLogs);
@@ -924,6 +930,8 @@ function updateStatus(status) {
     advancedLogPathEl.textContent = status.advanced_log_file || "-";
   }
   state.currentLogFile = status.log_file || "";
+  state.currentLogPrefix = status.config ? String(status.config.prefix || "") : null;
+  syncExportTitleControls();
   syncBssidSwitchState();
   if (status.ping_target) {
     pingDetailsEl.textContent = `${status.ping_target} (${status.ping_target_source})`;
@@ -970,7 +978,36 @@ function handleRecord(record) {
   if (!state.logsByPoint.has(record.point)) {
     state.logsByPoint.set(record.point, []);
   }
-  state.logsByPoint.get(record.point).push(record);
+  upsertRecordByIndex(state.logsByPoint.get(record.point), record);
+  let segmentUpdated = false;
+  state.segments.forEach((segment) => {
+    if (Number(segment.pointId) !== Number(record.point)) return;
+    upsertRecordByIndex(segment.logs, record);
+    segmentUpdated = true;
+  });
+  upsertRecordByIndex(state.liveBuffer, record);
+  while (state.liveBuffer.length > 12) {
+    state.liveBuffer.shift();
+  }
+  liveLog.textContent = state.liveBuffer.map(formatLiveRecord).join("\n");
+  if (segmentUpdated) {
+    scheduleRenderAll();
+  }
+}
+
+function upsertRecordByIndex(records, record) {
+  const recordIndex = Number(record.index);
+  const position = records.findIndex((entry) => Number(entry.index) === recordIndex);
+  if (position >= 0) {
+    records[position] = record;
+    return true;
+  }
+  records.push(record);
+  records.sort((left, right) => Number(left.index) - Number(right.index));
+  return false;
+}
+
+function formatLiveRecord(record) {
   const channelInfo =
     record.channel !== undefined && record.channel !== null && record.channel !== "" ? ` CH=${record.channel}` : "";
   const ssidInfo = record.ssid ? ` SSID=${record.ssid}` : "";
@@ -983,25 +1020,25 @@ function handleRecord(record) {
   const advancedInfo = Array.isArray(record.advanced_snapshot_reasons) && record.advanced_snapshot_reasons.length
     ? ` ADV=${record.advanced_snapshot_reasons.join(",")}`
     : "";
-  state.liveBuffer.push(
-    `#${record.index} P${record.point} ping=${pingDisplay} RSSI=${record.rssi_dbm}${signalInfo}${channelInfo}${ssidInfo}${bssidInfo}${advancedInfo}`,
-  );
-  if (state.liveBuffer.length > 12) {
-    state.liveBuffer.shift();
-  }
-  liveLog.textContent = state.liveBuffer.join("\n");
+  const iwRssiInfo = record.iw_signal_dbm !== undefined && record.iw_signal_dbm !== null && record.iw_signal_dbm !== ""
+    ? ` RSSI(iw)=${record.iw_signal_dbm}dBm`
+    : "";
+  return `#${record.index} P${record.point} ping=${pingDisplay}${iwRssiInfo} RSSI(nmcli)=${record.rssi_dbm}${signalInfo}${channelInfo}${ssidInfo}${bssidInfo}${advancedInfo}`;
 }
 
 function formatPingDisplay(value, status) {
+  const normalizedStatus = String(status ?? "").trim();
+  if (normalizedStatus === "ping_pending") {
+    return "測定中";
+  }
+  if (normalizedStatus === "ping_timeout" || normalizedStatus === "timeout") {
+    return "timeout";
+  }
   const numeric = Number.parseFloat(value);
   if (Number.isNaN(numeric)) {
     const normalized = String(value ?? "").trim();
     if (normalized) {
       return normalized.endsWith("ms") ? normalized : `${normalized}ms`;
-    }
-    const normalizedStatus = String(status ?? "").trim();
-    if (normalizedStatus === "timeout") {
-      return "timeout";
     }
     if (normalizedStatus === "wifi_disconnected") {
       return "wifi_disconnected";
@@ -1351,6 +1388,7 @@ function buildReferenceSamples(rows) {
       ping_ms: normalizeExcelText(row.time_ms),
       signal_strength: normalizeExcelText(row.SignalStrength),
       rssi_dbm: normalizeExcelText(row.dBm),
+      iw_signal_dbm: normalizeExcelText(row.IwSignalDbm),
       bssid: normalizeExcelText(row.BSSID).toLowerCase(),
       ssid: normalizeExcelText(row.SSID),
       channel: normalizeExcelText(row.Channel),
@@ -1367,6 +1405,7 @@ function buildJetsonSamples(rows) {
       ping_ms: normalizeExcelText(row.ping_ms),
       signal_strength: normalizeExcelText(row.signal),
       rssi_dbm: normalizeExcelText(row.dbm),
+      iw_signal_dbm: normalizeExcelText(row.iw_signal_dbm ?? row.IwSignalDbm),
       bssid: normalizeExcelText(row.bssid).toLowerCase(),
       ssid: normalizeExcelText(row.ssid),
       channel: normalizeExcelText(row.channel),
@@ -1389,6 +1428,7 @@ function buildPointSamples(rows) {
       ping_ms: normalizeExcelText(row.ping_ms ?? row.time_ms),
       signal_strength: normalizeExcelText(row.signal ?? row.SignalStrength),
       rssi_dbm: normalizeExcelText(row.dbm ?? row.dBm),
+      iw_signal_dbm: normalizeExcelText(row.iw_signal_dbm ?? row.IwSignalDbm),
       bssid: normalizeExcelText(row.bssid ?? row.BSSID).toLowerCase(),
       ssid: normalizeExcelText(row.ssid ?? row.SSID),
       channel: normalizeExcelText(row.channel ?? row.Channel),
@@ -1415,6 +1455,7 @@ function buildImportedPointLog(sample) {
     rate: sample.rate || "",
     signal_strength: sample.signal_strength || "",
     rssi_dbm: sample.rssi_dbm || "",
+    iw_signal_dbm: sample.iw_signal_dbm || "",
     ping_ms: sample.ping_ms || "",
     status: sample.status || "",
     best_neighbor_bssid: sample.best_neighbor_bssid || "",
@@ -1430,6 +1471,7 @@ function buildNoDataLog(pointId) {
     ping_ms: "",
     signal_strength: "",
     rssi_dbm: "",
+    iw_signal_dbm: "",
     bssid: "",
     status: "no_data",
   };
@@ -1460,6 +1502,7 @@ function buildAlignedLog(refSample, jetSample) {
     rate: source.rate || refSample.rate || "",
     signal_strength: source.signal_strength || refSample.signal_strength || "",
     rssi_dbm: source.rssi_dbm || refSample.rssi_dbm || "",
+    iw_signal_dbm: source.iw_signal_dbm || refSample.iw_signal_dbm || "",
     ping_ms: source.ping_ms || refSample.ping_ms || "",
     status: source.status || refSample.status || "",
     best_neighbor_bssid: source.best_neighbor_bssid || "",
@@ -1799,6 +1842,7 @@ function normalizeMode(mode) {
   if (raw === "ping_levels" || raw === "ping-levels" || raw === "ping4" || raw === "ping_4_levels") return "ping_levels";
   if (raw === "ping_300" || raw === "ping300" || raw === "ping_300ms" || raw.includes("0-300")) return "ping_300";
   if (raw === "signal" || raw === "signal_%") return "signal";
+  if (raw === "iw_rssi" || raw === "iw-rssi" || raw === "iw_signal_dbm") return "iw_rssi";
   if (raw === "rssi" || raw === "rssi_dbm") return "rssi";
   if (raw === "bssid") return "bssid";
   if (raw === "best_neighbor_rssi" || raw === "best-neighbor-rssi") return "best_neighbor_rssi";
@@ -1813,10 +1857,11 @@ function normalizeStatus(status) {
 
 function resolveColor(mode, log) {
   const status = normalizeStatus(log.status);
+  const modeKey = normalizeMode(mode);
   if (status === "no_data") return NO_DATA_COLOR;
   if (status === "wifi_disconnected") return WIFI_DISCONNECTED_COLOR;
   if (status === "ping_timeout" || status === "timeout") return PING_TIMEOUT_COLOR;
-  const modeKey = normalizeMode(mode);
+  if (status === "ping_pending" && modeKey.startsWith("ping")) return PING_PENDING_COLOR;
   const pingCap = 30;
   const ping300Cap = 300;
   if (modeKey === "ping") {
@@ -1843,6 +1888,10 @@ function resolveColor(mode, log) {
   }
   if (modeKey === "rssi") {
     const value = clamp(parseFloat(log.rssi_dbm), -100, -30);
+    return gradientStops(value, -100, -30, rssiStops);
+  }
+  if (modeKey === "iw_rssi") {
+    const value = clamp(parseFloat(log.iw_signal_dbm), -100, -30);
     return gradientStops(value, -100, -30, rssiStops);
   }
   if (modeKey === "bssid") {
@@ -1903,11 +1952,13 @@ const ping300Gradient = [
 
 const WIFI_DISCONNECTED_COLOR = "#424851";
 const PING_TIMEOUT_COLOR = "#ff4d22";
+const PING_PENDING_COLOR = "#8b95a5";
 const NO_DATA_COLOR = "#b8bec6";
 const statusLegendConfig = {
   label: "Status",
   type: "steps",
   steps: [
+    { label: "Ping 測定中", color: PING_PENDING_COLOR },
     { label: "Ping timeout", color: PING_TIMEOUT_COLOR },
     { label: "Wi-Fi disconnected", color: WIFI_DISCONNECTED_COLOR },
     { label: "No data", color: NO_DATA_COLOR },
@@ -1966,7 +2017,14 @@ const legendConfigs = {
     formatter: (value) => formatLegendValue(value, "%"),
   },
   rssi: {
-    label: "RSSI (dBm)",
+    label: "従来RSSI換算値 (nmcli)",
+    type: "gradient",
+    stops: rssiStops,
+    ticks: [-100, -90, -80, -70, -60, -50, -40, -30],
+    formatter: (value) => formatLegendValue(value, "dBm"),
+  },
+  iw_rssi: {
+    label: "接続中AP RSSI (iw)",
     type: "gradient",
     stops: rssiStops,
     ticks: [-100, -90, -80, -70, -60, -50, -40, -30],
@@ -2427,7 +2485,7 @@ function downloadCanvasPng(exportCanvas, filename, successMessage) {
 
 function exportPlotImage(options = {}) {
   if (!canvas) return;
-  const baseTitle = (options.filePrefix || exportTitleInput?.value || "").trim();
+  const baseTitle = (options.filePrefix || getExportBaseTitle()).trim();
   const modeKey = normalizeMode(options.modeOverride || state.currentMode);
   const exportData = buildExportCanvas(modeKey, baseTitle);
   if (!exportData) {
@@ -2450,10 +2508,11 @@ function hasAnyBestNeighborData() {
 function getExportAllLayout() {
   const modes = [
     { mode: "ping", row: 0, col: 0 },
-    { mode: "rssi", row: 0, col: 1 },
+    { mode: "iw_rssi", row: 0, col: 1 },
     { mode: "ping_300", row: 1, col: 0 },
-    { mode: "signal", row: 1, col: 1 },
+    { mode: "rssi", row: 1, col: 1 },
     { mode: "ping_levels", row: 2, col: 0 },
+    { mode: "signal", row: 2, col: 1 },
     { mode: "bssid", row: 3, col: 0 },
   ];
   if (hasAnyBestNeighborData()) {
@@ -2467,7 +2526,7 @@ function getExportAllLayout() {
 
 function exportAllLegendImages() {
   const layout = getExportAllLayout();
-  const prefix = (exportTitleInput?.value || "").trim() || "plot";
+  const prefix = getExportBaseTitle() || "plot";
   const cards = [];
 
   for (const entry of layout) {
@@ -2540,6 +2599,41 @@ function exportAllLegendImages() {
 }
 function sanitizeFileName(name) {
   return name.replace(/[\\/:*?"<>|]/g, "_") || "plot";
+}
+
+function getLogFileStem(path) {
+  const basename = String(path || "").replace(/\\/g, "/").split("/").pop() || "";
+  return basename.replace(/\.csv$/i, "");
+}
+
+function getExportBaseTitle() {
+  const titleMode = exportTitleModeSelect?.value || "log";
+  if (titleMode === "custom") {
+    return (exportTitleInput?.value || "").trim();
+  }
+  if (titleMode === "prefix") {
+    const prefix = state.currentLogPrefix ?? form.prefix?.value ?? "";
+    return String(prefix).trim().replace(/_+$/, "");
+  }
+  return getLogFileStem(state.currentLogFile);
+}
+
+function syncExportTitleControls() {
+  if (!exportTitleInput) return;
+  const titleMode = exportTitleModeSelect?.value || "log";
+  const useCustomTitle = titleMode === "custom";
+  exportTitleInput.disabled = !useCustomTitle;
+  if (useCustomTitle) {
+    exportTitleInput.placeholder = "例: 5F 西側";
+    return;
+  }
+  if (titleMode === "prefix") {
+    const prefixTitle = getExportBaseTitle();
+    exportTitleInput.placeholder = prefixTitle || "ログ Prefixが未入力です";
+    return;
+  }
+  const logTitle = getLogFileStem(state.currentLogFile);
+  exportTitleInput.placeholder = logTitle || "測定開始後にログファイル名を使用";
 }
 
 function renderSsidOptions() {

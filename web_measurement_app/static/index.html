@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Wi-Fi Measurement Dashboard</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260814_diagnostics" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260817_iw_rssi" />
   </head>
   <body>
     <header>
@@ -148,7 +148,7 @@
                 <input type="number" name="channel_max" min="1" />
               </label>
               <label>ログ Prefix
-                <input type="text" name="prefix" placeholder="例: buildingA_" />
+                <input type="text" name="prefix" placeholder="例: buildingA（区切り _ は自動）" />
               </label>
               <label>ログ Base 名
                 <input type="text" name="log_base" />
@@ -156,8 +156,14 @@
               <label>出力ディレクトリ
                 <input type="text" name="output_dir" value="." />
               </label>
-              <label>スキャン間隔 (秒)
-                <input type="number" step="0.1" min="0.1" name="interval" />
+              <label>測定間隔
+                <select name="interval">
+                  <option value="0.2">0.2秒（高密度）</option>
+                  <option value="0.5" selected>0.5秒（標準）</option>
+                  <option value="1">1秒（負荷軽減）</option>
+                  <option value="2">2秒（低頻度）</option>
+                  <option value="5">5秒（定点測定）</option>
+                </select>
               </label>
               <label>Wi-Fi再接続試行間隔 (秒)
                 <input type="number" min="5" max="3600" name="wifi_reconnect_cooldown_sec" />
@@ -262,11 +268,16 @@
             <label><input type="radio" name="mode" value="ping_levels" /> Ping (4-Levels)</label>
             <label><input type="radio" name="mode" value="ping_300" /> Ping (0-300ms)</label>
             <label><input type="radio" name="mode" value="signal" /> Signal (%)</label>
-            <label><input type="radio" name="mode" value="rssi" /> RSSI (dBm)</label>
+            <label><input type="radio" name="mode" value="iw_rssi" /> 接続中AP RSSI（iw・空間測定用）</label>
+            <label><input type="radio" name="mode" value="rssi" /> 従来RSSI換算値（nmcli・過去ログ比較用）</label>
             <label><input type="radio" name="mode" value="bssid" /> BSSID</label>
             <label><input type="radio" name="mode" value="best_neighbor_rssi" /> Best Neighbor RSSI</label>
             <label><input type="radio" name="mode" value="best_neighbor_bssid" /> Best Neighbor BSSID</label>
           </div>
+        </div>
+        <div class="rssi-mode-help">
+          <p><strong>接続中AP RSSI（iw）:</strong> Wi-Fiドライバが現在接続しているBSSIDについて返すRSSIです。取得周期ごとに更新され、空間の電波状況確認に使用します。</p>
+          <p><strong>従来RSSI換算値（nmcli）:</strong> Wi-Fi一覧のSIGNAL（%）をdBmへ換算した従来値です。スキャンキャッシュで更新が遅れるため、過去ログとの比較用です。</p>
         </div>
 
         <div class="import-toolbar">
@@ -356,8 +367,16 @@
 
         <div class="export-controls">
           <label>
-            画像タイトル
-            <input type="text" id="export-title" placeholder="例: 5F 西側" />
+            画像タイトルの指定
+            <select id="export-title-mode">
+              <option value="log" selected>ログファイル名を使用</option>
+              <option value="prefix">ログ Prefixを使用</option>
+              <option value="custom">自由入力</option>
+            </select>
+          </label>
+          <label>
+            自由入力タイトル
+            <input type="text" id="export-title" placeholder="例: 5F 西側" disabled />
           </label>
           <label class="export-toggle">
             <input type="checkbox" id="title-toggle" checked />
@@ -378,6 +397,6 @@
       </section>
     </main>
 
-    <script defer src="/static/app.js?v=20260814_diagnostics"></script>
+    <script defer src="/static/app.js?v=20260817_iw_rssi"></script>
   </body>
 </html>

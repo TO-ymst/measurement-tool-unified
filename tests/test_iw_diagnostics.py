@@ -1,6 +1,9 @@
+import csv
+import io
 import unittest
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 from web_measurement_app.logger_core import (
     HEADERS,
@@ -10,6 +13,7 @@ from web_measurement_app.logger_core import (
     RUNTIME_HEADERS,
     SURVEY_HEADERS,
     build_nmcli_command,
+    combine_log_name,
     parse_iw_survey_dump,
     parse_iw_station_dump,
 )
@@ -53,6 +57,19 @@ EXPECTED_LEGACY_HEADERS = [
 
 
 class IwDiagnosticsTest(unittest.TestCase):
+    @staticmethod
+    def _pending_log_line(index, point):
+        line = ["" for _header in LEGACY_HEADERS + IW_HEADERS]
+        line[0] = index
+        line[1] = point
+        line[2] = "2026-08-17"
+        line[3] = '="12:00:00.000"'
+        line[4] = "TriOrb-OA"
+        line[5] = "30:DE:4B:4A:12:67"
+        line[12] = ""
+        line[13] = "ping_pending"
+        return line
+
     def test_regular_nmcli_capture_never_triggers_rescan(self):
         command = build_nmcli_command(False)
         self.assertEqual(command[-3:], ["list", "--rescan", "no"])
@@ -61,6 +78,24 @@ class IwDiagnosticsTest(unittest.TestCase):
         config = MeasurementConfig()
         expected = str(Path(__file__).resolve().parent.parent)
         self.assertEqual(config.output_dir, expected)
+
+    def test_measurement_interval_defaults_to_recommended_option(self):
+        self.assertEqual(MeasurementConfig().interval, 0.5)
+
+    def test_measurement_interval_accepts_only_ui_options(self):
+        for interval in (0.2, 0.5, 1.0, 2.0, 5.0):
+            with self.subTest(interval=interval):
+                self.assertEqual(MeasurementConfig(interval=interval).interval, interval)
+
+        for interval in (0.1, 0.3, 3.0, 10.0):
+            with self.subTest(interval=interval):
+                with self.assertRaises(ValueError):
+                    MeasurementConfig(interval=interval)
+
+    def test_log_prefix_and_base_use_exactly_one_separator(self):
+        self.assertEqual(combine_log_name("buildingA", "rec_wifi_logs"), "buildingA_rec_wifi_logs")
+        self.assertEqual(combine_log_name("buildingA_", "_rec_wifi_logs"), "buildingA_rec_wifi_logs")
+        self.assertEqual(combine_log_name("", "rec_wifi_logs"), "rec_wifi_logs")
 
     def test_legacy_columns_are_unchanged_and_first(self):
         self.assertEqual(LEGACY_HEADERS, EXPECTED_LEGACY_HEADERS)
@@ -165,6 +200,83 @@ class IwDiagnosticsTest(unittest.TestCase):
         self.assertEqual(line[len(LEGACY_HEADERS) + len(IW_HEADERS)], "1")
         self.assertTrue(line[len(LEGACY_HEADERS) + len(IW_HEADERS) + len(PING_STAT_HEADERS)] != "")
         self.assertTrue(all(value == "" for value in line[-len(SURVEY_HEADERS) :]))
+
+    def test_realtime_record_exposes_existing_iw_signal(self):
+        service = MeasurementService()
+        line = ["" for _header in HEADERS]
+        line[0] = "10"
+        line[1] = "3"
+        line[HEADERS.index("IwSignalDbm")] = "-67"
+
+        record = service._build_record(line, "")
+
+        self.assertEqual(record["iw_signal_dbm"], "-67")
+
+    def test_sample_wait_subtracts_processing_time(self):
+        service = MeasurementService()
+        service._sample_started_monotonic = 100.0
+        with patch("web_measurement_app.service.time.monotonic", return_value=100.078):
+            with patch.object(service._stop_event, "wait") as wait:
+                service._wait_for_next_sample(0.5)
+
+        wait.assert_called_once()
+        self.assertAlmostEqual(wait.call_args.args[0], 0.422)
+
+    def test_sample_wait_is_zero_after_interval_overrun(self):
+        service = MeasurementService()
+        service._sample_started_monotonic = 100.0
+        with patch("web_measurement_app.service.time.monotonic", return_value=100.75):
+            with patch.object(service._stop_event, "wait") as wait:
+                service._wait_for_next_sample(0.5)
+
+        wait.assert_called_once_with(0.0)
+
+    def test_async_ping_results_update_matching_index_and_flush_in_order(self):
+        service = MeasurementService()
+        config = MeasurementConfig(interval=0.5, survey_enabled=False)
+        service._config = config
+        service._sample_started_monotonic = 100.0
+        first = self._pending_log_line(0, 2)
+        with patch("web_measurement_app.service.time.monotonic", return_value=100.05):
+            service._register_pending_local_row(first, "", config, completed=False)
+        service._sample_started_monotonic = 100.5
+        service._sample_period_ms = 500.0
+        second = self._pending_log_line(1, 3)
+        with patch("web_measurement_app.service.time.monotonic", return_value=100.55):
+            service._register_pending_local_row(second, "", config, completed=False)
+
+        service._complete_local_ping(1, 0, ("2", "64", "12.5", "ok"))
+        self.assertEqual(service.get_logs(3)[0]["ping_ms"], "12.5")
+        self.assertEqual(service.get_logs(2)[0]["status"], "ping_pending")
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        service._flush_completed_local_rows(writer, output)
+        self.assertEqual(output.getvalue(), "")
+
+        service._complete_local_ping(0, 0, ("timeout", "timeout", "999.0", "ping_timeout"))
+        service._flush_completed_local_rows(writer, output)
+        rows = list(csv.reader(io.StringIO(output.getvalue())))
+
+        self.assertEqual([row[0] for row in rows], ["0", "1"])
+        self.assertEqual([row[1] for row in rows], ["2", "3"])
+        self.assertEqual([row[13] for row in rows], ["ping_timeout", "ok"])
+        self.assertEqual(len(service.get_logs(2)), 1)
+        self.assertEqual(service.get_logs(2)[0]["ping_pending"], False)
+
+    def test_stale_async_ping_generation_cannot_update_new_measurement(self):
+        service = MeasurementService()
+        config = MeasurementConfig(interval=0.5, survey_enabled=False)
+        service._config = config
+        service._sample_started_monotonic = 100.0
+        line = self._pending_log_line(0, 4)
+        with patch("web_measurement_app.service.time.monotonic", return_value=100.05):
+            service._register_pending_local_row(line, "", config, completed=False)
+
+        service._ping_generation = 1
+        service._complete_local_ping(0, 0, ("1", "64", "10", "ok"))
+
+        self.assertEqual(service.get_logs(4)[0]["status"], "ping_pending")
 
     def test_survey_is_not_started_by_default(self):
         service = MeasurementService()
