@@ -63,6 +63,14 @@ const referenceCsvInput = document.getElementById("reference-csv-file");
 const overlayCsvInput = document.getElementById("overlay-csv-file");
 const importAlignedBtn = document.getElementById("import-aligned-btn");
 const importToleranceInput = document.getElementById("import-tolerance-ms");
+const neighborCsvInput = document.getElementById("neighbor-csv-file");
+const compareKindSelect = document.getElementById("compare-kind-select");
+const compareSsidSelect = document.getElementById("compare-ssid-select");
+const compareTopNInput = document.getElementById("compare-top-n");
+const compareLiveBtn = document.getElementById("compare-live-btn");
+const compareTargetSelect = document.getElementById("compare-target-select");
+const compareExportSheetBtn = document.getElementById("compare-export-sheet-btn");
+const compareExportEachBtn = document.getElementById("compare-export-each-btn");
 
 const state = {
   running: false,
@@ -88,6 +96,16 @@ const state = {
   currentLogFile: "",
   currentLogPrefix: null,
   currentMode: "ping",
+  compare: {
+    source: "",
+    sourceName: "",
+    liveTotal: 0,
+    liveTimer: null,
+    rows: [],
+    scansByPoint: new Map(),
+    targets: [],
+    selected: 0,
+  },
   image: null,
   view: {
     scale: 1,
@@ -265,9 +283,23 @@ function attachEvents() {
   modeRadios.forEach((radio) =>
     radio.addEventListener("change", () => {
       state.currentMode = radio.value;
+      if (radio.value === "compare" && !state.compare.source) {
+        loadLiveNeighborRows({ reset: true });
+      }
       renderAll();
     }),
   );
+  // 再読込時にブラウザが復元したラジオ選択と表示モードを揃える
+  const restoredMode = Array.from(modeRadios).find((radio) => radio.checked);
+  if (restoredMode) {
+    state.currentMode = restoredMode.value;
+    if (restoredMode.value === "compare") loadLiveNeighborRows({ reset: true });
+  }
+  state.compare.liveTimer = window.setInterval(() => {
+    if (state.running && state.currentMode === "compare" && state.compare.source === "live") {
+      loadLiveNeighborRows();
+    }
+  }, 3000);
 
   if (legendToggle) {
     legendToggle.addEventListener("change", renderLegend);
@@ -288,6 +320,34 @@ function attachEvents() {
   if (importPointBtn) {
     importPointBtn.addEventListener("click", handleImportPointLogs);
   }
+  if (neighborCsvInput) {
+    neighborCsvInput.addEventListener("change", handleNeighborCsvFile);
+  }
+  if (compareLiveBtn) {
+    compareLiveBtn.addEventListener("click", () => loadLiveNeighborRows({ reset: true, switchMode: true }));
+  }
+  if (compareKindSelect) {
+    compareKindSelect.addEventListener("change", () => buildCompareTargets({ switchMode: true }));
+  }
+  if (compareSsidSelect) {
+    compareSsidSelect.addEventListener("change", () => buildCompareTargets({ switchMode: true }));
+  }
+  if (compareTopNInput) {
+    compareTopNInput.addEventListener("change", () => buildCompareTargets({ switchMode: true }));
+  }
+  if (compareTargetSelect) {
+    compareTargetSelect.addEventListener("change", () => {
+      state.compare.selected = Number.parseInt(compareTargetSelect.value, 10) || 0;
+      renderAll();
+    });
+  }
+  if (compareExportSheetBtn) {
+    compareExportSheetBtn.addEventListener("click", exportCompareSheet);
+  }
+  if (compareExportEachBtn) {
+    compareExportEachBtn.addEventListener("click", exportCompareEach);
+  }
+  syncCompareControls();
 
   if (autoGatewayCheckbox && pingTargetInput) {
     const syncPingTargetState = () => {
@@ -1646,6 +1706,306 @@ async function handleImportPointLogs() {
   }
 }
 
+const HIDDEN_SSID_LABEL = "(非公開SSID)";
+
+function toCompareRow(point, scan, ssid, bssid, dbm) {
+  return {
+    point: Number.parseInt(String(point ?? "").trim(), 10),
+    scan: String(scan ?? ""),
+    ssid: normalizeExcelText(ssid),
+    bssid: normalizeExcelText(bssid).toLowerCase(),
+    dbm: Number.parseFloat(normalizeExcelText(dbm)),
+  };
+}
+
+function isValidCompareRow(row) {
+  return Number.isInteger(row.point) && row.point > 0 && row.bssid && !Number.isNaN(row.dbm);
+}
+
+function compareSsidLabel(ssid) {
+  return ssid || HIDDEN_SSID_LABEL;
+}
+
+function summarizeByKey(rows, keyOf) {
+  const summary = new Map();
+  rows.forEach((row) => {
+    const key = keyOf(row);
+    const entry = summary.get(key) || { key, peak: -Infinity, bssids: new Set() };
+    entry.peak = Math.max(entry.peak, row.dbm);
+    entry.bssids.add(row.bssid);
+    summary.set(key, entry);
+  });
+  return Array.from(summary.values()).sort((a, b) => b.peak - a.peak);
+}
+
+function syncCompareControls() {
+  const isBssid = compareKindSelect?.value !== "ssid";
+  if (compareSsidSelect) {
+    compareSsidSelect.disabled = !isBssid || compareSsidSelect.options.length === 0;
+  }
+  const hasTargets = state.compare.targets.length > 0;
+  if (compareTargetSelect) compareTargetSelect.disabled = !hasTargets;
+  if (compareExportSheetBtn) compareExportSheetBtn.disabled = !hasTargets;
+  if (compareExportEachBtn) compareExportEachBtn.disabled = !hasTargets;
+}
+
+function setCompareHint(message, isWarning) {
+  const hint = document.getElementById("compare-hint");
+  if (!hint) return;
+  hint.textContent = message;
+  hint.style.color = isWarning ? "#ff8a65" : "";
+  hint.style.fontWeight = isWarning ? "600" : "";
+}
+
+function setCompareRows(rows) {
+  state.compare.rows = rows;
+  const scansByPoint = new Map();
+  rows.forEach((row) => {
+    if (!scansByPoint.has(row.point)) scansByPoint.set(row.point, new Map());
+    const scans = scansByPoint.get(row.point);
+    if (!scans.has(row.scan)) scans.set(row.scan, []);
+    scans.get(row.scan).push(row);
+  });
+  state.compare.scansByPoint = scansByPoint;
+
+  if (compareSsidSelect) {
+    // 初回は接続中SSIDを優先し、2回目以降は選び直した値を保つ
+    const hadOptions = compareSsidSelect.options.length > 0;
+    const previous = compareSsidSelect.value;
+    const connectedSsid = form.ssid?.value || "";
+    const ssidSummary = summarizeByKey(rows, (row) => row.ssid);
+    compareSsidSelect.innerHTML = "";
+    ssidSummary.forEach((entry) => {
+      const option = document.createElement("option");
+      option.value = entry.key;
+      option.textContent = `${compareSsidLabel(entry.key)}（BSSID ${entry.bssids.size}個・最大 ${entry.peak.toFixed(1)} dBm）`;
+      compareSsidSelect.appendChild(option);
+    });
+    const keys = ssidSummary.map((entry) => entry.key);
+    if (hadOptions && keys.includes(previous)) {
+      compareSsidSelect.value = previous;
+    } else if (keys.includes(connectedSsid)) {
+      compareSsidSelect.value = connectedSsid;
+    }
+  }
+  buildCompareTargets();
+}
+
+async function loadLiveNeighborRows({ reset = false, switchMode = false } = {}) {
+  try {
+    if (reset || state.compare.source !== "live") {
+      state.compare.source = "live";
+      state.compare.liveTotal = 0;
+      state.compare.rows = [];
+    }
+    const resp = await fetch(`/api/neighbors?since=${state.compare.liveTotal}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    let rows = state.compare.rows;
+    // 新しい測定が始まった場合は取り直す
+    if (data.neighbor_log_file !== state.compare.sourceName || data.total < state.compare.liveTotal) {
+      state.compare.sourceName = data.neighbor_log_file || "";
+      if (state.compare.liveTotal > 0) {
+        return loadLiveNeighborRows({ reset: true, switchMode });
+      }
+    }
+    const added = (data.rows || [])
+      .map(([point, scan, ssid, bssid, , dbm]) => toCompareRow(point, scan, ssid, bssid, dbm))
+      .filter(isValidCompareRow);
+    state.compare.liveTotal = data.total || 0;
+    if (added.length || reset || !rows.length) {
+      rows = rows.concat(added);
+      setCompareRows(rows);
+    }
+    if (switchMode) selectCompareMode();
+    if (!rows.length) {
+      const message =
+        "比較できるスキャン結果がありません。測定設定の「ネイバースキャンを取得」をONにして測定し直してください。";
+      statusMessage.textContent = message;
+      setCompareHint(message, true);
+    } else {
+      setCompareHint(`スキャン結果 ${rows.length} 行で比較しています。`, false);
+    }
+  } catch (error) {
+    console.error("load live neighbors", error);
+    statusMessage.textContent = `スキャン結果の取得に失敗しました: ${error.message}`;
+  }
+}
+
+async function handleNeighborCsvFile() {
+  const file = neighborCsvInput?.files?.[0];
+  if (!file) return;
+  try {
+    const rows = parseCsvText(await readFileAsText(file))
+      .map((row) => {
+        const scan = normalizeExcelText(row.ScanIndex) || `${normalizeExcelText(row.Date)} ${normalizeExcelText(row.Time)}`;
+        return toCompareRow(row.Point, scan, row.SSID, row.BSSID, row.dBm);
+      })
+      .filter(isValidCompareRow);
+    if (!rows.length) {
+      throw new Error("Point・BSSID・dBm列付きの有効な行が見つかりませんでした。");
+    }
+    state.compare.source = "csv";
+    state.compare.sourceName = file.name;
+    setCompareRows(rows);
+    setCompareHint(`${file.name}（${rows.length} 行）で比較しています。`, false);
+    selectCompareMode();
+    statusMessage.textContent = `ネイバーCSV ${rows.length} 行を読み込みました。`;
+  } catch (error) {
+    console.error("import neighbor csv", error);
+    statusMessage.textContent = `ネイバーCSVの読込に失敗しました: ${error.message}`;
+  } finally {
+    neighborCsvInput.value = "";
+  }
+}
+
+function buildCompareTargets({ switchMode = false } = {}) {
+  syncCompareControls();
+  const rows = state.compare.rows;
+  const kind = compareKindSelect?.value === "ssid" ? "ssid" : "bssid";
+  const topN = clamp(Number.parseInt(compareTopNInput?.value || "10", 10) || 10, 1, 50);
+  const previousKey = state.compare.targets[state.compare.selected]?.key;
+  let targets;
+  if (kind === "ssid") {
+    targets = summarizeByKey(rows, (row) => row.ssid)
+      .slice(0, topN)
+      .map((entry) => ({
+        kind,
+        key: entry.key,
+        label: compareSsidLabel(entry.key),
+        peak: entry.peak,
+        matches: (row) => row.ssid === entry.key,
+      }));
+  } else {
+    const ssid = compareSsidSelect?.value ?? "";
+    targets = summarizeByKey(
+      rows.filter((row) => row.ssid === ssid),
+      (row) => row.bssid,
+    )
+      .slice(0, topN)
+      .map((entry) => ({
+        kind,
+        key: entry.key,
+        label: `${compareSsidLabel(ssid)} ${entry.key}`,
+        peak: entry.peak,
+        matches: (row) => row.ssid === ssid && row.bssid === entry.key,
+      }));
+  }
+
+  state.compare.targets = targets;
+  state.compare.selected = Math.max(0, targets.findIndex((target) => target.key === previousKey));
+  if (compareTargetSelect) {
+    compareTargetSelect.innerHTML = "";
+    targets.forEach((target, idx) => {
+      const option = document.createElement("option");
+      option.value = String(idx);
+      option.textContent = `${idx + 1}. ${target.label}（最大 ${target.peak.toFixed(1)} dBm）`;
+      compareTargetSelect.appendChild(option);
+    });
+    compareTargetSelect.value = String(state.compare.selected);
+  }
+  syncCompareControls();
+  if (switchMode) selectCompareMode();
+  if (state.currentMode === "compare") renderAll();
+}
+
+function selectCompareMode() {
+  const compareRadio = Array.from(modeRadios).find((radio) => radio.value === "compare");
+  if (compareRadio) compareRadio.checked = true;
+  state.currentMode = "compare";
+  renderAll();
+}
+
+// 現在のポイント配置から対象ごとの区間ログを組み立てる（ポイント追加に追従させるため都度生成）
+function buildCompareSegments(target) {
+  if (!target) return [];
+  const scansByPoint = state.compare.scansByPoint;
+  if (!scansByPoint.size) return [];
+  const segments = [];
+  const maxPointId = Math.max(...scansByPoint.keys());
+  for (let pointId = 1; pointId <= maxPointId; pointId += 1) {
+    const start = state.points[pointId - 1];
+    const end = state.points[pointId];
+    if (!start || !end) continue;
+    const scans = scansByPoint.get(pointId);
+    const logs = scans
+      ? Array.from(scans.values()).map((scanRows) => {
+          const values = scanRows.filter(target.matches).map((row) => row.dbm);
+          if (!values.length) {
+            return { point: pointId, compare_dbm: "", status: "not_visible" };
+          }
+          return { point: pointId, compare_dbm: String(Math.max(...values)), status: "ok" };
+        })
+      : [buildNoDataLog(pointId)];
+    segments.push({ pointId, start: { ...start }, end: { ...end }, logs });
+  }
+  return segments;
+}
+
+function activeSegments(modeKey) {
+  if (modeKey === "compare") {
+    return buildCompareSegments(state.compare.targets[state.compare.selected]);
+  }
+  return state.segments;
+}
+
+function compareExportTitle(target) {
+  return `${target.label} RSSI`;
+}
+
+function compareExportPrefix() {
+  return getExportBaseTitle() || getLogFileStem(state.compare.sourceName) || "plot";
+}
+
+function exportCompareSheet() {
+  const targets = state.compare.targets;
+  if (!targets.length) {
+    statusMessage.textContent = "比較する対象がありません。";
+    return;
+  }
+  const prefix = compareExportPrefix();
+  const cards = [];
+  targets.forEach((target, idx) => {
+    const exportData = buildExportCanvas("compare", prefix, {
+      title: compareExportTitle(target),
+      segments: buildCompareSegments(target),
+      forceTitle: true,
+    });
+    if (!exportData) return;
+    cards.push({ row: Math.floor(idx / 2), col: idx % 2, ...exportData });
+  });
+  const kindToken = targets[0].kind === "ssid" ? "ssid-compare" : "bssid-compare";
+  composeExportSheet(cards, prefix, kindToken, "比較画像（一覧）を書き出しました。");
+}
+
+function exportCompareEach() {
+  const targets = state.compare.targets;
+  if (!targets.length) {
+    statusMessage.textContent = "比較する対象がありません。";
+    return;
+  }
+  const prefix = compareExportPrefix();
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const safePrefix = sanitizeFileName(prefix);
+  targets.forEach((target, idx) => {
+    // ブラウザが連続ダウンロードを取りこぼさないよう少しずつずらす
+    window.setTimeout(() => {
+      const exportData = buildExportCanvas("compare", prefix, {
+        title: compareExportTitle(target),
+        segments: buildCompareSegments(target),
+        forceTitle: true,
+      });
+      if (!exportData) return;
+      const rank = String(idx + 1).padStart(2, "0");
+      downloadCanvasPng(
+        exportData.canvas,
+        `${safePrefix}_compare_${rank}_${sanitizeFileName(target.label)}_${timestamp}.png`,
+        `比較画像を ${idx + 1}/${targets.length} 件書き出しました。`,
+      );
+    }, idx * 400);
+  });
+}
+
 function handleMapFile(event) {
   const file = event.target.files?.[0];
   if (!file) return;
@@ -1723,7 +2083,7 @@ function drawCanvas(targetCtx = ctx, targetCanvas = canvas) {
 
 function renderAll() {
   drawCanvas();
-  state.segments.forEach((segment) => drawSegment(segment));
+  activeSegments(normalizeMode(state.currentMode)).forEach((segment) => drawSegment(segment));
   drawPointLabels();
   renderLegend();
 }
@@ -1859,6 +2219,11 @@ function resolveColor(mode, log) {
   const status = normalizeStatus(log.status);
   const modeKey = normalizeMode(mode);
   if (status === "no_data") return NO_DATA_COLOR;
+  if (status === "not_visible") return NOT_VISIBLE_COLOR;
+  if (modeKey === "compare") {
+    const value = clamp(parseFloat(log.compare_dbm), -100, -30);
+    return gradientStops(value, -100, -30, rssiStops);
+  }
   if (status === "wifi_disconnected") return WIFI_DISCONNECTED_COLOR;
   if (status === "ping_timeout" || status === "timeout") return PING_TIMEOUT_COLOR;
   if (status === "ping_pending" && modeKey.startsWith("ping")) return PING_PENDING_COLOR;
@@ -1954,6 +2319,7 @@ const WIFI_DISCONNECTED_COLOR = "#424851";
 const PING_TIMEOUT_COLOR = "#ff4d22";
 const PING_PENDING_COLOR = "#8b95a5";
 const NO_DATA_COLOR = "#b8bec6";
+const NOT_VISIBLE_COLOR = "#6b4f8a";
 const statusLegendConfig = {
   label: "Status",
   type: "steps",
@@ -1961,6 +2327,15 @@ const statusLegendConfig = {
     { label: "Ping 測定中", color: PING_PENDING_COLOR },
     { label: "Ping timeout", color: PING_TIMEOUT_COLOR },
     { label: "Wi-Fi disconnected", color: WIFI_DISCONNECTED_COLOR },
+    { label: "No data", color: NO_DATA_COLOR },
+  ],
+  reverseSteps: false,
+};
+const compareStatusLegendConfig = {
+  label: "Status",
+  type: "steps",
+  steps: [
+    { label: "Not visible", color: NOT_VISIBLE_COLOR },
     { label: "No data", color: NO_DATA_COLOR },
   ],
   reverseSteps: false,
@@ -2037,7 +2412,24 @@ const legendConfigs = {
     ticks: [-100, -90, -80, -70, -60, -50, -40, -30],
     formatter: (value) => formatLegendValue(value, "dBm"),
   },
+  compare: {
+    label: "Scanned RSSI (dBm)",
+    type: "gradient",
+    stops: rssiStops,
+    ticks: [-100, -90, -80, -70, -60, -50, -40, -30],
+    formatter: (value) => formatLegendValue(value, "dBm"),
+  },
 };
+
+function legendConfigForMode(modeKey) {
+  if (modeKey === "bssid") return buildBssidLegendConfig();
+  if (modeKey === "best_neighbor_bssid") return buildBestNeighborBssidLegendConfig();
+  return legendConfigs[modeKey];
+}
+
+function statusLegendForMode(modeKey) {
+  return modeKey === "compare" ? compareStatusLegendConfig : statusLegendConfig;
+}
 
 function hashString(value) {
   let hash = 0;
@@ -2141,12 +2533,7 @@ function renderLegend() {
   legendContainer.classList.remove("hidden");
   legendContainer.innerHTML = "";
   const modeKey = normalizeMode(state.currentMode);
-  const config =
-    modeKey === "bssid"
-      ? buildBssidLegendConfig()
-      : modeKey === "best_neighbor_bssid"
-        ? buildBestNeighborBssidLegendConfig()
-        : legendConfigs[modeKey];
+  const config = legendConfigForMode(modeKey);
   if (!config) return;
 
   if (config.type === "gradient") {
@@ -2154,7 +2541,7 @@ function renderLegend() {
   } else if (config.type === "steps") {
     legendContainer.appendChild(createStepLegend(config));
   }
-  legendContainer.appendChild(createStepLegend(statusLegendConfig));
+  legendContainer.appendChild(createStepLegend(statusLegendForMode(modeKey)));
 }
 
 function createVerticalGradientLegend(config) {
@@ -2365,22 +2752,18 @@ function estimateLegendExportWidth(config) {
   return Math.max(defaultWidth, computed);
 }
 
-function buildExportCanvas(modeKey, baseTitle) {
-  const currentLegendConfig =
-    modeKey === "bssid"
-      ? buildBssidLegendConfig()
-      : modeKey === "best_neighbor_bssid"
-        ? buildBestNeighborBssidLegendConfig()
-        : legendConfigs[modeKey];
-  const legendConfig = currentLegendConfig;
-  const modeLabel = legendConfig?.label || modeKey;
+function buildExportCanvas(modeKey, baseTitle, options = {}) {
+  const legendConfig = legendConfigForMode(modeKey);
+  const statusLegend = statusLegendForMode(modeKey);
+  const segments = options.segments || activeSegments(modeKey);
+  const modeLabel = options.title || legendConfig?.label || modeKey;
   const suffix = modeLabel ? ` ${modeLabel}` : "";
   const finalTitle = baseTitle ? `${baseTitle}${suffix}` : suffix.trim();
   const margin = 80;
-  const includeTitle = titleToggle ? titleToggle.checked : true;
+  const includeTitle = options.forceTitle || (titleToggle ? titleToggle.checked : true);
   const titleHeight = includeTitle && finalTitle ? 220 : 0;
   const legendWidth = legendConfig
-    ? Math.max(estimateLegendExportWidth(legendConfig), estimateLegendExportWidth(statusLegendConfig))
+    ? Math.max(estimateLegendExportWidth(legendConfig), estimateLegendExportWidth(statusLegend))
     : 0;
   const legendGap = legendConfig ? 60 : 0;
   const totalWidth = canvas.width + legendWidth + legendGap + margin * 2;
@@ -2404,7 +2787,7 @@ function buildExportCanvas(modeKey, baseTitle) {
     return null;
   }
   drawCanvas(plotCtx, plotCanvas);
-  state.segments.forEach((segment) => drawSegment(segment, modeKey, plotCtx));
+  segments.forEach((segment) => drawSegment(segment, modeKey, plotCtx));
   drawPointLabels(plotCtx);
 
   const mapX = margin;
@@ -2435,7 +2818,7 @@ function buildExportCanvas(modeKey, baseTitle) {
     drawLegendOnCanvas(tempCtx, legendConfig, legendX, legendY, metricHeight, legendWidth, { showAxisLabel: false });
     drawLegendOnCanvas(
       tempCtx,
-      statusLegendConfig,
+      statusLegend,
       legendX,
       legendY + metricHeight + statusGap,
       statusHeight,
@@ -2485,9 +2868,18 @@ function downloadCanvasPng(exportCanvas, filename, successMessage) {
 
 function exportPlotImage(options = {}) {
   if (!canvas) return;
-  const baseTitle = (options.filePrefix || getExportBaseTitle()).trim();
   const modeKey = normalizeMode(options.modeOverride || state.currentMode);
-  const exportData = buildExportCanvas(modeKey, baseTitle);
+  const compareTarget = modeKey === "compare" ? state.compare.targets[state.compare.selected] : null;
+  if (modeKey === "compare" && !compareTarget) {
+    statusMessage.textContent = "比較する対象がありません。";
+    return;
+  }
+  const baseTitle = (options.filePrefix || (compareTarget ? compareExportPrefix() : getExportBaseTitle())).trim();
+  const exportData = buildExportCanvas(
+    modeKey,
+    baseTitle,
+    compareTarget ? { title: compareExportTitle(compareTarget), forceTitle: true } : {},
+  );
   if (!exportData) {
     statusMessage.textContent = "画像の生成に失敗しました。";
     return;
@@ -2495,7 +2887,9 @@ function exportPlotImage(options = {}) {
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const safeTitle = baseTitle ? sanitizeFileName(baseTitle) : "plot";
-  const modeToken = sanitizeFileName(modeKey.replace(/_/g, "-"));
+  const modeToken = compareTarget
+    ? `compare_${sanitizeFileName(compareTarget.label)}`
+    : sanitizeFileName(modeKey.replace(/_/g, "-"));
   downloadCanvasPng(exportData.canvas, `${safeTitle}_${modeToken}_${timestamp}.png`, "画像を書き出しました。");
 }
 
@@ -2536,6 +2930,10 @@ function exportAllLegendImages() {
     cards.push({ modeKey, row: entry.row, col: entry.col, ...exportData });
   }
 
+  composeExportSheet(cards, prefix, "all-modes", "全モードのレジェンド付きプロット画像を書き出しました。");
+}
+
+function composeExportSheet(cards, prefix, fileToken, successMessage) {
   if (!cards.length) {
     statusMessage.textContent = "書き出し対象がありません。";
     return;
@@ -2575,7 +2973,7 @@ function exportAllLegendImages() {
   sctx.fillStyle = "#0f1115";
   sctx.fillRect(0, 0, sheetWidth, sheetHeight);
 
-  const title = `${prefix} all-modes`;
+  const title = `${prefix} ${fileToken}`;
   sctx.fillStyle = "#f7f7fb";
   sctx.font = `600 ${Math.max(18, Math.round(42 * scale))}px 'Segoe UI', 'Helvetica Neue', sans-serif`;
   sctx.textAlign = "left";
@@ -2591,11 +2989,7 @@ function exportAllLegendImages() {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const safePrefix = sanitizeFileName(prefix);
   const resizeNote = scale < 0.999 ? "（ブラウザ上限に合わせて縮小）" : "";
-  downloadCanvasPng(
-    sheet,
-    `${safePrefix}_all-modes_${timestamp}.png`,
-    `全モードのレジェンド付きプロット画像を書き出しました。${resizeNote}`,
-  );
+  downloadCanvasPng(sheet, `${safePrefix}_${fileToken}_${timestamp}.png`, `${successMessage}${resizeNote}`);
 }
 function sanitizeFileName(name) {
   return name.replace(/[\\/:*?"<>|]/g, "_") || "plot";

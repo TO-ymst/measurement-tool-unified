@@ -344,6 +344,11 @@ async def fetch_logs(point_id: int):
     return service.get_logs(point_id)
 
 
+@app.get("/api/neighbors")
+async def fetch_neighbors(since: int = 0):
+    return service.get_neighbor_rows(since)
+
+
 @app.post("/api/corrections/hide-point")
 async def hide_point_and_generate_csv(payload: HidePointRequest):
     source_path = _resolve_source_csv_path(payload.source_csv)

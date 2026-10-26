@@ -295,6 +295,8 @@ class MeasurementService:
         self._connection_event_path: Optional[Path] = None
         self._neighbor_log_index = 0
         self._neighbor_scan_index = 0
+        # ダッシュボードの比較プロット用。[Point, ScanIndex, SSID, BSSID, Channel, dBm]
+        self._neighbor_history: List[List[Any]] = []
         self._advanced_log_path: Optional[Path] = None
         self._ping_target_info: Optional[Tuple[str, str]] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -341,6 +343,7 @@ class MeasurementService:
             self._connection_event_path = prepare_connection_event_file(self._log_path)
             self._neighbor_log_index = 0
             self._neighbor_scan_index = 0
+            self._neighbor_history = []
             self._neighbor_scan_generation += 1
             self._pending_neighbor_result = None
             self._survey_generation += 1
@@ -391,7 +394,8 @@ class MeasurementService:
                 )
 
             self._measurement_ssid_lock_owned = False
-            if config.measurement_mode == "local" and config.exclusive_ssid_during_measurement:
+            # SSID固定はJetson/Linux専用のため、Windowsローカルでは行わない
+            if config.measurement_mode == "local" and config.exclusive_ssid_during_measurement and not IS_WINDOWS:
                 current_wifi = get_current_local_wifi_state(config.use_sudo)
                 current_ssid = str(current_wifi.get("ssid", "")).strip()
                 if current_ssid != config.ssid:
@@ -511,6 +515,14 @@ class MeasurementService:
         with self._lock:
             deque_list = self._history.get(point, deque())
             return list(deque_list)
+
+    def get_neighbor_rows(self, since: int = 0) -> Dict[str, Any]:
+        history = self._neighbor_history
+        return {
+            "neighbor_log_file": str(self._neighbor_log_path) if self._neighbor_log_path else None,
+            "total": len(history),
+            "rows": history[max(0, since):],
+        }
 
     def list_local_access_points(self) -> Dict[str, Any]:
         if IS_WINDOWS:
@@ -1808,6 +1820,16 @@ class MeasurementService:
                 ]
             )
             self._neighbor_log_index += 1
+            self._neighbor_history.append(
+                [
+                    point,
+                    scan_index,
+                    neighbor.get("ssid", ""),
+                    neighbor.get("bssid", ""),
+                    neighbor.get("channel", ""),
+                    dbm,
+                ]
+            )
 
     def _timestamp_and_point(self) -> Tuple[str, str, int]:
         now = dt.datetime.now(dt.timezone.utc).astimezone()

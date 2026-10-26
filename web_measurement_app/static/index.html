@@ -273,7 +273,38 @@
             <label><input type="radio" name="mode" value="bssid" /> BSSID</label>
             <label><input type="radio" name="mode" value="best_neighbor_rssi" /> Best Neighbor RSSI</label>
             <label><input type="radio" name="mode" value="best_neighbor_bssid" /> Best Neighbor BSSID</label>
+            <label><input type="radio" name="mode" value="compare" /> SSID/BSSID比較（スキャン）</label>
           </div>
+        </div>
+
+        <div class="import-toolbar compare-toolbar">
+          <label>
+            比較方法
+            <select id="compare-kind-select">
+              <option value="bssid" selected>指定SSID内のBSSIDを比較</option>
+              <option value="ssid">SSIDを比較（強い順）</option>
+            </select>
+          </label>
+          <label>
+            対象SSID
+            <select id="compare-ssid-select" disabled></select>
+          </label>
+          <label>
+            表示件数（強い順）
+            <input type="number" id="compare-top-n" min="1" max="50" step="1" value="10" />
+          </label>
+          <button type="button" id="compare-live-btn">測定データで比較</button>
+          <label class="file-input">
+            過去のネイバーCSVで比較
+            <input type="file" id="neighbor-csv-file" accept=".csv,text/csv" />
+          </label>
+          <label>
+            マップに表示する対象
+            <select id="compare-target-select" disabled></select>
+          </label>
+          <button type="button" id="compare-export-sheet-btn">比較画像を書き出す（一覧1枚）</button>
+          <button type="button" id="compare-export-each-btn">比較画像を書き出す（対象ごと）</button>
+          <small class="hint" id="compare-hint">測定設定の「ネイバースキャンを取得」をONにして測ると、スキャンで見えたAPを同じルート上で比べられます。</small>
         </div>
         <div class="rssi-mode-help">
           <p><strong>接続中AP RSSI（iw）:</strong> Wi-Fiドライバが現在接続しているBSSIDについて返すRSSIです。取得周期ごとに更新され、空間の電波状況確認に使用します。</p>
