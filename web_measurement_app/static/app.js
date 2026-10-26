@@ -101,6 +101,7 @@ const state = {
     sourceName: "",
     liveTotal: 0,
     liveTimer: null,
+    liveRequest: null,
     rows: [],
     scansByPoint: new Map(),
     targets: [],
@@ -283,8 +284,8 @@ function attachEvents() {
   modeRadios.forEach((radio) =>
     radio.addEventListener("change", () => {
       state.currentMode = radio.value;
-      if (radio.value === "compare" && !state.compare.source) {
-        loadLiveNeighborRows({ reset: true });
+      if (radio.value === "compare" && state.compare.source !== "csv") {
+        loadLiveNeighborRows();
       }
       renderAll();
     }),
@@ -296,7 +297,7 @@ function attachEvents() {
     if (restoredMode.value === "compare") loadLiveNeighborRows({ reset: true });
   }
   state.compare.liveTimer = window.setInterval(() => {
-    if (state.running && state.currentMode === "compare" && state.compare.source === "live") {
+    if (state.currentMode === "compare" && state.compare.source === "live") {
       loadLiveNeighborRows();
     }
   }, 3000);
@@ -814,6 +815,9 @@ async function handleStart() {
     liveLog.textContent = "";
     renderAll();
     updateStatus(status);
+    if (state.compare.source === "live") {
+      await loadLiveNeighborRows({ reset: true });
+    }
     if (payload.measurement_mode === "local" && payload.exclusive_ssid_during_measurement) {
       state.apLock = { locked: "yes", ssid: payload.ssid || "", disabled_count: "-" };
       if (apSwitchStatus) {
@@ -837,6 +841,11 @@ async function handleStop() {
     state.running = false;
     state.pointOffset = Math.max(0, (status.current_point || 1) - 1);
     updateStatus(status);
+    if (state.compare.source === "live") {
+      // 停止前から進行中の取得を待ち、最後のスキャンまで取り直す。
+      await state.compare.liveRequest;
+      if (state.compare.source === "live") await loadLiveNeighborRows();
+    }
     if (status.config?.measurement_mode === "local") {
       await loadAccessPointCandidates();
     }
@@ -1792,21 +1801,39 @@ function setCompareRows(rows) {
 }
 
 async function loadLiveNeighborRows({ reset = false, switchMode = false } = {}) {
+  // 自動更新と手動取得が重なっても同じ差分を二重に取り込まない。
+  if (state.compare.liveRequest) {
+    await state.compare.liveRequest;
+    if (!reset && !switchMode) return;
+    return loadLiveNeighborRows({ reset, switchMode });
+  }
+  const request = fetchLiveNeighborRows({ reset, switchMode });
+  state.compare.liveRequest = request;
+  try {
+    await request;
+  } finally {
+    state.compare.liveRequest = null;
+  }
+}
+
+async function fetchLiveNeighborRows({ reset = false, switchMode = false } = {}) {
   try {
     if (reset || state.compare.source !== "live") {
       state.compare.source = "live";
       state.compare.liveTotal = 0;
       state.compare.rows = [];
     }
-    const resp = await fetch(`/api/neighbors?since=${state.compare.liveTotal}`);
+    const resp = await fetch(`/api/neighbors?since=${state.compare.liveTotal}`, { cache: "no-store" });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
+    // 取得中に過去CSVへ切り替えた場合は、その選択を優先する。
+    if (state.compare.source !== "live") return;
     let rows = state.compare.rows;
     // 新しい測定が始まった場合は取り直す
     if (data.neighbor_log_file !== state.compare.sourceName || data.total < state.compare.liveTotal) {
       state.compare.sourceName = data.neighbor_log_file || "";
       if (state.compare.liveTotal > 0) {
-        return loadLiveNeighborRows({ reset: true, switchMode });
+        return fetchLiveNeighborRows({ reset: true, switchMode });
       }
     }
     const added = (data.rows || [])
